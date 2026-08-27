@@ -79,8 +79,19 @@ final class SessionListViewModel {
     /// server omits the field — the Archived entry stays hidden then.
     private(set) var archivedCount: Int?
 
-    private(set) var remoteContentSearchSessionIDs: [String] = []
+    /// Compact full-history rows from `/api/sessions/search`. Kept separate from
+    /// `sessions` so full-history hits can appear during an active search without
+    /// bloating the bounded recent cockpit list.
+    private(set) var remoteSearchSessions: [SessionSummary] = []
     private var activeRemoteSearchQuery: String?
+
+    /// Stable session IDs for the active remote full-history payload.
+    var remoteSearchSessionIDs: [String] {
+        remoteSearchSessions.compactMap { session in
+            guard let sessionID = Self.nonEmpty(session.sessionId) else { return nil }
+            return sessionID
+        }
+    }
 
     private let client: APIClient
     private let sessionMutator: SessionMutator
@@ -165,17 +176,32 @@ final class SessionListViewModel {
             return sortedLocalMatches
         }
 
-        let localMatchIDs = Set(sortedLocalMatches.compactMap(\.sessionId))
-        let sessionsByID = Dictionary(
-            projectFilteredSessions.compactMap { session -> (String, SessionSummary)? in
-                guard let sessionID = session.sessionId, !sessionID.isEmpty else { return nil }
+        let localMatchIDs = Set(sortedLocalMatches.compactMap { Self.nonEmpty($0.sessionId) })
+        // Prefer the already-loaded cockpit row when present so project/source
+        // metadata and timestamps stay richer than the compact search payload.
+        let localSessionsByID = Dictionary(
+            sessions.compactMap { session -> (String, SessionSummary)? in
+                guard let sessionID = Self.nonEmpty(session.sessionId) else { return nil }
                 return (sessionID, session)
             },
             uniquingKeysWith: { first, _ in first }
         )
-        let remoteMatches = remoteContentSearchSessionIDs.compactMap { sessionID -> SessionSummary? in
-            guard !localMatchIDs.contains(sessionID) else { return nil }
-            return sessionsByID[sessionID]
+        let remoteMatches = remoteSearchSessions.compactMap { remoteSession -> SessionSummary? in
+            guard let sessionID = Self.nonEmpty(remoteSession.sessionId),
+                  !localMatchIDs.contains(sessionID)
+            else {
+                return nil
+            }
+
+            let candidate = localSessionsByID[sessionID] ?? remoteSession
+            guard candidate.archived != true else { return nil }
+            guard candidate.shouldAppearInSessionList else { return nil }
+            guard automatedVisibility.shows(candidate) else { return nil }
+            if let selectedProjectID {
+                guard candidate.projectId == selectedProjectID else { return nil }
+            }
+
+            return candidate
         }
 
         return sortedLocalMatches + Self.sortedSessions(remoteMatches)
@@ -217,7 +243,8 @@ final class SessionListViewModel {
 
         do {
             let response = try await client.sessions()
-            let visibleSessions = (response.sessions ?? [])
+            let responseSessions = response.sessions ?? []
+            let visibleSessions = responseSessions
                 .filter {
                     Self.nonEmpty($0.sessionId) != nil
                         && $0.archived != true
@@ -345,7 +372,7 @@ final class SessionListViewModel {
     ) async {
         let query = Self.normalizedSearchQuery(rawQuery)
         activeRemoteSearchQuery = query
-        remoteContentSearchSessionIDs = []
+        remoteSearchSessions = []
         searchErrorMessage = nil
 
         guard !query.isEmpty, !isViewingCachedData else {
@@ -365,7 +392,7 @@ final class SessionListViewModel {
 
             guard !Task.isCancelled, activeRemoteSearchQuery == query else { return }
 
-            remoteContentSearchSessionIDs = contentMatchIDs(from: response.sessions ?? [])
+            remoteSearchSessions = remoteMatchSessions(from: response.sessions ?? [])
             isSearchingRemoteSessions = false
         } catch {
             guard activeRemoteSearchQuery == query else { return }
@@ -373,7 +400,7 @@ final class SessionListViewModel {
             isSearchingRemoteSessions = false
             guard !isCancellationError(error) else { return }
 
-            remoteContentSearchSessionIDs = []
+            remoteSearchSessions = []
             searchErrorMessage = error.localizedDescription
             lastError = error
         }
@@ -381,7 +408,7 @@ final class SessionListViewModel {
 
     func clearSearchResults() {
         activeRemoteSearchQuery = nil
-        remoteContentSearchSessionIDs = []
+        remoteSearchSessions = []
         searchErrorMessage = nil
         isSearchingRemoteSessions = false
     }
@@ -1009,27 +1036,24 @@ final class SessionListViewModel {
         }
     }
 
-    private func contentMatchIDs(from sessions: [SessionSummary]) -> [String] {
-        let locallyVisibleSessionIDs = Set(self.sessions.compactMap { session -> String? in
-            guard session.archived != true, let sessionID = session.sessionId, !sessionID.isEmpty else {
-                return nil
-            }
-
-            return sessionID
-        })
+    /// Keeps title and content matches, including older sessions absent from the
+    /// bounded recent list. The server owns archive/profile scope; this final
+    /// archived check is defensive for mixed-version responses.
+    private func remoteMatchSessions(from sessions: [SessionSummary]) -> [SessionSummary] {
         var seenSessionIDs = Set<String>()
 
         return sessions.compactMap { session in
-            guard session.matchType?.lowercased() == "content",
-                  let sessionID = session.sessionId,
-                  locallyVisibleSessionIDs.contains(sessionID),
+            guard let matchType = session.matchType?.lowercased(),
+                  matchType == "content" || matchType == "title",
+                  let sessionID = Self.nonEmpty(session.sessionId),
+                  session.archived != true,
                   !seenSessionIDs.contains(sessionID)
             else {
                 return nil
             }
 
             seenSessionIDs.insert(sessionID)
-            return sessionID
+            return session
         }
     }
 

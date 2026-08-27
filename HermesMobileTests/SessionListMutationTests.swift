@@ -2107,10 +2107,110 @@ final class SessionListMutationTests: XCTestCase {
             viewModel.visibleSessions(searchText: "needle", selectedProjectID: "project-2").compactMap(\.sessionId),
             ["content-other-project"]
         )
+        // Full-history hits appear only while search is active; archived rows
+        // stay out, duplicates collapse, and local title matches lead.
         XCTAssertEqual(
             viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).compactMap(\.sessionId),
-            ["local-title", "content-other-project", "content-project"]
+            ["local-title", "content-other-project", "content-project", "unknown-session", "title-only"]
         )
+        XCTAssertFalse(viewModel.sessions.contains(where: { $0.sessionId == "unknown-session" }))
+    }
+
+    @MainActor
+    func testRemoteSessionSearchSurfacesOlderUnknownRowOnlyWhileSearchActive() async throws {
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/sessions":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {
+                      "session_id": "recent-only",
+                      "title": "Recent planning",
+                      "last_message_at": 100,
+                      "archived": false
+                    }
+                  ]
+                }
+                """, for: request)
+            case "/api/sessions/search":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {
+                      "session_id": "older-history",
+                      "title": "Archaeology notes",
+                      "project_id": "project-archive",
+                      "last_message_at": 10,
+                      "match_type": "content"
+                    },
+                    {
+                      "session_id": "title-only-remote",
+                      "title": "needle title",
+                      "match_type": "title"
+                    },
+                    {
+                      "session_id": "archived-history",
+                      "title": "Archived hit",
+                      "archived": true,
+                      "match_type": "content"
+                    }
+                  ],
+                  "query": "needle",
+                  "count": 3
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.load()
+
+        XCTAssertEqual(viewModel.sessions.compactMap(\.sessionId), ["recent-only"])
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", selectedProjectID: nil).compactMap(\.sessionId),
+            ["recent-only"]
+        )
+        XCTAssertTrue(
+            viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).isEmpty
+        )
+
+        await viewModel.searchSessions(query: "needle", debounceNanoseconds: 0)
+
+        XCTAssertEqual(viewModel.remoteSearchSessionIDs, ["older-history", "title-only-remote"])
+        XCTAssertEqual(
+            viewModel.remoteSearchSessions.compactMap(\.sessionId),
+            ["older-history", "title-only-remote"]
+        )
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).compactMap(\.sessionId),
+            ["older-history", "title-only-remote"]
+        )
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "needle", selectedProjectID: "project-archive").compactMap(\.sessionId),
+            ["older-history"]
+        )
+        XCTAssertTrue(
+            viewModel.visibleSessions(searchText: "needle", selectedProjectID: "other-project").isEmpty
+        )
+        // Bounded recent cockpit stays untouched — search rows are not merged in.
+        XCTAssertEqual(viewModel.sessions.compactMap(\.sessionId), ["recent-only"])
+        XCTAssertFalse(viewModel.sessions.contains(where: { $0.sessionId == "older-history" }))
+
+        viewModel.clearSearchResults()
+
+        XCTAssertTrue(viewModel.remoteSearchSessionIDs.isEmpty)
+        XCTAssertTrue(viewModel.remoteSearchSessions.isEmpty)
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", selectedProjectID: nil).compactMap(\.sessionId),
+            ["recent-only"]
+        )
+        XCTAssertTrue(
+            viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).isEmpty
+        )
+        XCTAssertEqual(viewModel.sessions.compactMap(\.sessionId), ["recent-only"])
     }
 
     @MainActor
@@ -2125,11 +2225,13 @@ final class SessionListMutationTests: XCTestCase {
                     {
                       "session_id": "old-content",
                       "title": "First result",
+                      "last_message_at": 20,
                       "archived": false
                     },
                     {
                       "session_id": "new-content",
                       "title": "Second result",
+                      "last_message_at": 50,
                       "archived": false
                     }
                   ]
@@ -2146,10 +2248,11 @@ final class SessionListMutationTests: XCTestCase {
                     return apiTestJSONResponse("""
                     {
                       "sessions": [
-                        {"session_id": "old-content", "title": "First result", "match_type": "content"}
+                        {"session_id": "old-content", "title": "First result", "match_type": "content"},
+                        {"session_id": "stale-older-history", "title": "Stale older", "match_type": "content"}
                       ],
                       "query": "old",
-                      "count": 1
+                      "count": 2
                     }
                     """, for: request)
                 }
@@ -2158,10 +2261,11 @@ final class SessionListMutationTests: XCTestCase {
                     return apiTestJSONResponse("""
                     {
                       "sessions": [
-                        {"session_id": "new-content", "title": "Second result", "match_type": "content"}
+                        {"session_id": "new-content", "title": "Second result", "match_type": "content"},
+                        {"session_id": "fresh-older-history", "title": "Fresh older", "last_message_at": 5, "match_type": "content"}
                       ],
                       "query": "new",
-                      "count": 1
+                      "count": 2
                     }
                     """, for: request)
                 }
@@ -2183,11 +2287,17 @@ final class SessionListMutationTests: XCTestCase {
         await viewModel.searchSessions(query: "new", debounceNanoseconds: 0)
         await oldTask.value
 
-        XCTAssertEqual(viewModel.remoteContentSearchSessionIDs, ["new-content"])
+        XCTAssertEqual(viewModel.remoteSearchSessionIDs, ["new-content", "fresh-older-history"])
         XCTAssertEqual(
             viewModel.visibleSessions(searchText: "new", selectedProjectID: nil).compactMap(\.sessionId),
-            ["new-content"]
+            ["new-content", "fresh-older-history"]
         )
+        XCTAssertFalse(viewModel.remoteSearchSessionIDs.contains("stale-older-history"))
+        XCTAssertFalse(
+            viewModel.visibleSessions(searchText: "new", selectedProjectID: nil)
+                .contains(where: { $0.sessionId == "stale-older-history" })
+        )
+        XCTAssertFalse(viewModel.sessions.contains(where: { $0.sessionId == "fresh-older-history" }))
     }
 
     // MARK: - Cron/CLI session classification (#256)
