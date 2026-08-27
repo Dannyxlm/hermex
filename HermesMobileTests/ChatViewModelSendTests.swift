@@ -5710,6 +5710,49 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
+    func testSelectingReasoningEffortWithNilSessionIDIsBlocked() async throws {
+        let session = SessionSummary(
+            sessionId: nil,
+            title: "Planning",
+            workspace: "/tmp/workspace",
+            model: "gpt-5.4",
+            modelProvider: "openai",
+            profile: "work"
+        )
+        let viewModel = try makeViewModel(sessionSummary: session) { request in
+            XCTFail("Selecting reasoning without a session ID must not call \(request.url?.path ?? "nil").")
+            throw URLError(.badURL)
+        }
+
+        let didSelect = await viewModel.selectReasoningEffort("high")
+
+        XCTAssertFalse(didSelect)
+        XCTAssertEqual(viewModel.composerConfigurationErrorMessage, "The server did not provide a session ID.")
+    }
+
+    @MainActor
+    func testReasoningSlashCommandIncludesActiveSessionID() async throws {
+        let viewModel = try makeViewModel(
+            sessionSummary: makeSession(model: "gpt-5.4", modelProvider: "openai", profile: "work")
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/reasoning")
+            XCTAssertEqual(request.httpMethod, "POST")
+            let body = try XCTUnwrap(apiTestJSONBody(from: request))
+            XCTAssertEqual(body["effort"] as? String, "high")
+            XCTAssertEqual(body["session_id"] as? String, "session-abc")
+            return apiTestJSONResponse(#"{"ok":true,"reasoning_effort":"high"}"#, for: request)
+        }
+
+        let result = await viewModel.executeSlashCommand(
+            try XCTUnwrap(SlashCommandCatalog.command(named: "reasoning")),
+            args: "high"
+        )
+
+        XCTAssertEqual(result, .executed(message: nil))
+        XCTAssertEqual(viewModel.selectedReasoningEffort, "high")
+    }
+
+    @MainActor
     func testSelectingCustomComposerModelSessionUpdateOmittingProviderFallsBackToOptionProvider() async throws {
         let customModel = "moonshotai/kimi-k2-0905"
         var requestPaths: [String] = []
@@ -5762,6 +5805,9 @@ final class ChatViewModelSendTests: XCTestCase {
         ) { request in
             switch request.url?.path {
             case "/api/reasoning" where request.httpMethod == "POST":
+                let body = try XCTUnwrap(apiTestJSONBody(from: request))
+                XCTAssertEqual(body["effort"] as? String, "xhigh")
+                XCTAssertEqual(body["session_id"] as? String, "session-abc")
                 return apiTestJSONResponse(#"{"ok": true, "reasoning_effort": "xhigh"}"#, for: request)
             case "/api/session/update":
                 return apiTestJSONResponse("""

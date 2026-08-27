@@ -247,7 +247,7 @@ The server keeps connections alive for ~30s with `: heartbeat` comments. **Cloud
 | GET | `/api/settings` | Bot name, theme hints, version |
 | POST | `/api/default-model` | Save global default model from Settings |
 | GET | `/api/reasoning` | Read current reasoning display/effort |
-| POST | `/api/reasoning` | Save reasoning effort from the composer menu |
+| POST | `/api/reasoning` | Save conversation reasoning effort from the composer menu. Body: `{session_id, effort}`. `session_id` is mandatory for effort changes; never fall back to a profile-global write when it is unavailable. Display show/hide remains a separate global preference. |
 | GET | `/api/profiles` | Populate profile picker |
 | POST | `/api/profile/switch` | Switch active profile for this client via profile cookie; do not expose profile create/delete in v1 |
 | GET | `/api/personalities` | Populate slash-command sub-argument suggestions for `/personality` |
