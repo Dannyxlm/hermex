@@ -421,12 +421,18 @@ struct SessionListRowsSection: View {
     let showsWorkspace: Bool
     let selectedSessionID: String?
     let actions: SessionListRowActions
+    let retrySearch: () -> Void
     var suppressEmptyState = false
 
     var body: some View {
         sessionsHeaderRow
             .padding(.top, isSearchActive ? 16 : 28)
             .sessionsScreenListRow()
+
+        if isSearchActive, let searchErrorMessage = viewModel.searchErrorMessage {
+            searchErrorRow(message: searchErrorMessage)
+                .sessionsScreenListRow()
+        }
 
         if viewModel.isLoading && viewModel.sessions.isEmpty {
             sessionLoadingSkeletonRows
@@ -511,6 +517,27 @@ struct SessionListRowsSection: View {
                 .contentShape(Rectangle())
                 .accessibilityLabel("Retry loading sessions")
                 .accessibilityHint("Attempts to reconnect to the server and reload sessions.")
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private func searchErrorRow(message: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SessionListStatusRow(
+                title: String(localized: "Could not search full history"),
+                description: message,
+                systemImage: "exclamationmark.magnifyingglass",
+                descriptionLineLimit: 3
+            )
+
+            Button("Retry", action: retrySearch)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.primary)
+                .buttonStyle(.plain)
+                .frame(minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+                .accessibilityLabel("Retry full-history search")
+                .accessibilityHint("Searches older sessions again.")
         }
         .padding(.horizontal, 24)
     }

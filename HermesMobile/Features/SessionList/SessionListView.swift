@@ -511,6 +511,16 @@ struct SessionListView: View {
                     ? navigationState.selectedSessionID
                     : nil,
                 actions: sessionRowActions,
+                retrySearch: {
+                    Task {
+                        await viewModel.searchSessions(
+                            query: searchText,
+                            content: true,
+                            depth: 5,
+                            debounceNanoseconds: 0
+                        )
+                    }
+                },
                 suppressEmptyState: !scheduledSessionGroups.scheduled.isEmpty
             )
 
