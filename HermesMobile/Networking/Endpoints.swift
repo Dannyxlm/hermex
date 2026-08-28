@@ -397,7 +397,8 @@ enum Endpoint {
             return [
                 URLQueryItem(name: "q", value: query),
                 URLQueryItem(name: "content", value: content ? "1" : "0"),
-                URLQueryItem(name: "depth", value: "\(depth)")
+                URLQueryItem(name: "depth", value: "\(depth)"),
+                URLQueryItem(name: "limit", value: "20")
             ]
         case let .session(id, includeMessages, messageLimit, messageBefore, expandRenderable):
             var items = [

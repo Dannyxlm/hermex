@@ -143,6 +143,7 @@ final class APIClientSessionListTests: APIClientTestCase {
             XCTAssertEqual(query["q"], "billing plan")
             XCTAssertEqual(query["content"], "1")
             XCTAssertEqual(query["depth"], "5")
+            XCTAssertEqual(query["limit"], "20")
 
             return apiTestJSONResponse("""
             {
@@ -177,6 +178,7 @@ final class APIClientSessionListTests: APIClientTestCase {
             XCTAssertEqual(query["q"], "")
             XCTAssertEqual(query["content"], "1")
             XCTAssertEqual(query["depth"], "5")
+            XCTAssertEqual(query["limit"], "20")
 
             return apiTestJSONResponse("""
             {

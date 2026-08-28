@@ -33,7 +33,7 @@ final class ContractReadinessTests: XCTestCase {
                 method: "GET",
                 endpoint: .sessionsSearch(query: "billing plan", content: true, depth: 5),
                 path: "/api/sessions/search",
-                query: ["q": "billing plan", "content": "1", "depth": "5"]
+                query: ["q": "billing plan", "content": "1", "depth": "5", "limit": "20"]
             ),
             .init(
                 name: "session detail",
