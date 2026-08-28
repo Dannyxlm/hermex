@@ -2819,7 +2819,7 @@ final class ChatViewModel {
     private func switchReasoningFromSlashCommand(_ args: String) async -> SlashCommandExecutionResult {
         let reasoning = args.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !reasoning.isEmpty else {
-            return .unsupported(friendlyMessage: String(localized: "Usage: /reasoning show|hide|none|minimal|low|medium|high|xhigh"))
+            return .unsupported(friendlyMessage: String(localized: "Usage: /reasoning show|hide|none|minimal|low|medium|high|xhigh|max|ultra"))
         }
 
         guard canRunConfigurationSlashCommand(String(localized: "change reasoning")) else {
@@ -3845,6 +3845,33 @@ final class ChatViewModel {
 
     func reconnectStreamIfNeeded(modelContext: ModelContext? = nil) async {
         await streamCoordinator.reconnectIfNeeded(modelContext: modelContext)
+    }
+
+    /// Reconcile the visible chat whenever iOS returns the app to the foreground.
+    /// Background execution is opportunistic, so the server transcript is the
+    /// authority: resume a deliberately suspended stream, check an apparently
+    /// live connection for a completion we may have missed, or refresh an idle
+    /// chat that could have received its final reply while the process slept.
+    func reconcileAfterSceneActivation(modelContext: ModelContext? = nil) async {
+        guard sessionID != nil else { return }
+
+        guard let expectedStreamID = activeStreamID else {
+            await loadMessages(modelContext: modelContext)
+            return
+        }
+
+        if isActiveStreamConnectionSuspended {
+            await reconnectStreamIfNeeded(modelContext: modelContext)
+            return
+        }
+
+        await refreshTranscriptIfActiveStreamCompleted(
+            streamID: expectedStreamID,
+            modelContext: modelContext
+        )
+        if activeStreamID == expectedStreamID {
+            await recoverStaleActiveStreamIfNeeded(modelContext: modelContext)
+        }
     }
 
     func refreshTranscriptIfActiveStreamCompleted(
@@ -4970,7 +4997,7 @@ final class ChatViewModel {
     }
 
     private static let reasoningDisplayArgs: Set<String> = ["show", "hide", "on", "off"]
-    private static let reasoningEffortArgs: Set<String> = ["none", "minimal", "low", "medium", "high", "xhigh"]
+    private static let reasoningEffortArgs: Set<String> = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
     private static let personalityClearArgs: Set<String> = ["none", "default", "clear"]
 
     private static func btwMessageText(question: String, answer: String?, isLoading: Bool) -> String {

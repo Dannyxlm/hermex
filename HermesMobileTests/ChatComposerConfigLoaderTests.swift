@@ -253,14 +253,20 @@ final class ReasoningEffortGatingTests: XCTestCase {
     func testOptionsFallBackToStaticListWithoutServerVocabulary() {
         XCTAssertEqual(
             ReasoningEffortOption.options(forSupportedEfforts: nil).map(\.id),
-            ["none", "minimal", "low", "medium", "high", "xhigh"]
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
         )
         // Defensive: an empty list also falls back (the control is hidden
         // before this is rendered because supports_reasoning_effort is false).
         XCTAssertEqual(
             ReasoningEffortOption.options(forSupportedEfforts: []).map(\.id),
-            ["none", "minimal", "low", "medium", "high", "xhigh"]
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
         )
+    }
+
+    func testOptionsGiveMaxAndUltraStableProductLabels() {
+        let options = ReasoningEffortOption.options(forSupportedEfforts: ["max", "ultra"])
+        XCTAssertEqual(options.map(\.id), ["max", "ultra"])
+        XCTAssertEqual(options.map(\.title), ["Max", "Ultra"])
     }
 
     func testOptionsFilterToServerVocabularyPreservingServerOrder() {

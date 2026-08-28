@@ -442,7 +442,9 @@ struct ReasoningEffortOption: Identifiable, CaseIterable {
         ReasoningEffortOption(id: "low", title: String(localized: "Low")),
         ReasoningEffortOption(id: "medium", title: String(localized: "Medium")),
         ReasoningEffortOption(id: "high", title: String(localized: "High")),
-        ReasoningEffortOption(id: "xhigh", title: String(localized: "XHigh"))
+        ReasoningEffortOption(id: "xhigh", title: String(localized: "XHigh")),
+        ReasoningEffortOption(id: "max", title: String(localized: "Max")),
+        ReasoningEffortOption(id: "ultra", title: String(localized: "Ultra"))
     ]
 
     static func title(for effort: String) -> String {

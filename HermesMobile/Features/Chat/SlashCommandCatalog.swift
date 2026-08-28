@@ -185,6 +185,6 @@ enum SlashCommandCatalog {
         allCommands.first { $0.name.lowercased() == name.lowercased() }
     }
 
-    static let reasoningLevels = ["show", "hide", "none", "minimal", "low", "medium", "high", "xhigh"]
+    static let reasoningLevels = ["show", "hide", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
     static let goalActions = ["status", "pause", "resume", "clear"]
 }

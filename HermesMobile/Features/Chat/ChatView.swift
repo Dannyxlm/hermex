@@ -2194,7 +2194,7 @@ struct ChatView: View {
             viewModel.refreshListenPlaybackProgressAfterSceneActivation()
             endResponseCompletionBackgroundTask()
             Task {
-                await viewModel.reconnectStreamIfNeeded(modelContext: modelContext)
+                await viewModel.reconcileAfterSceneActivation(modelContext: modelContext)
 
                 if let lastError = viewModel.lastError {
                     onAPIError(lastError)

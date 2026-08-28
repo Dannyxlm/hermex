@@ -2277,7 +2277,7 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
-    func testActiveStreamStatusRefreshReloadsTranscriptWhenSSECompletionIsMissed() async throws {
+    func testSceneActivationReloadsTranscriptWhenSSECompletionIsMissed() async throws {
         let streamClient = SpySSEStreamingClient()
         var didRequestStatus = false
         var didReloadMessages = false
@@ -2333,7 +2333,7 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(viewModel.activeStreamID, "stream-123")
         XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working"])
 
-        await viewModel.refreshTranscriptIfActiveStreamCompleted(streamID: "stream-123")
+        await viewModel.reconcileAfterSceneActivation()
 
         XCTAssertTrue(didRequestStatus)
         XCTAssertTrue(didReloadMessages)
@@ -2342,6 +2342,45 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Keep working",
             "Final answer loaded without leaving the chat."
+        ])
+    }
+
+    @MainActor
+    func testSceneActivationReloadsIdleChatToCatchMissedReply() async throws {
+        var sessionReloadCount = 0
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            sessionReloadCount += 1
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "title": "Planning",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Keep working",
+                    "timestamp": 1770000100,
+                    "message_id": "user-1"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "Reply caught up on foreground.",
+                    "timestamp": 1770000110,
+                    "message_id": "assistant-1"
+                  }
+                ]
+              }
+            }
+            """, for: request)
+        }
+
+        await viewModel.reconcileAfterSceneActivation()
+
+        XCTAssertEqual(sessionReloadCount, 1)
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "Keep working",
+            "Reply caught up on foreground."
         ])
     }
 
