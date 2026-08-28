@@ -560,6 +560,16 @@ final class SessionListMutationTests: XCTestCase {
                   ]
                 }
                 """, for: request)
+            case "/api/sessions/search":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "default-profile-hit", "title": "Default profile", "match_type": "content"}
+                  ],
+                  "query": "profile",
+                  "count": 1
+                }
+                """, for: request)
             default:
                 XCTFail("Unexpected request path: \(path)")
                 throw URLError(.badURL)
@@ -567,15 +577,18 @@ final class SessionListMutationTests: XCTestCase {
         }
 
         await viewModel.loadActiveProfile()
+        await viewModel.searchSessions(query: "profile", debounceNanoseconds: 0)
+        XCTAssertEqual(viewModel.remoteSearchSessionIDs, ["default-profile-hit"])
         let workProfile = try XCTUnwrap(viewModel.profileOptions.first { $0.normalizedName == "work" })
         let didSwitch = await viewModel.switchActiveProfile(workProfile)
 
         XCTAssertTrue(didSwitch)
-        XCTAssertEqual(requestedPaths, ["/api/profiles", "/api/profile/switch"])
+        XCTAssertEqual(requestedPaths, ["/api/profiles", "/api/sessions/search", "/api/profile/switch"])
         XCTAssertEqual(viewModel.activeProfileName, "work")
         XCTAssertEqual(viewModel.activeProfileDisplayName, "work")
         XCTAssertEqual(viewModel.activeProfileModel, "claude-sonnet-4-5")
         XCTAssertEqual(viewModel.activeProfileProvider, "anthropic")
+        XCTAssertTrue(viewModel.remoteSearchSessionIDs.isEmpty)
         XCTAssertFalse(viewModel.isSwitchingActiveProfile)
         XCTAssertNil(viewModel.switchingActiveProfileName)
         XCTAssertNil(viewModel.activeProfileErrorMessage)
@@ -2150,6 +2163,11 @@ final class SessionListMutationTests: XCTestCase {
                       "match_type": "title"
                     },
                     {
+                      "session_id": "untitled-content-hit",
+                      "title": "Untitled Session",
+                      "match_type": "content"
+                    },
+                    {
                       "session_id": "archived-history",
                       "title": "Archived hit",
                       "archived": true,
@@ -2157,7 +2175,7 @@ final class SessionListMutationTests: XCTestCase {
                     }
                   ],
                   "query": "needle",
-                  "count": 3
+                  "count": 4
                 }
                 """, for: request)
             default:
@@ -2179,14 +2197,17 @@ final class SessionListMutationTests: XCTestCase {
 
         await viewModel.searchSessions(query: "needle", debounceNanoseconds: 0)
 
-        XCTAssertEqual(viewModel.remoteSearchSessionIDs, ["older-history", "title-only-remote"])
+        XCTAssertEqual(
+            viewModel.remoteSearchSessionIDs,
+            ["older-history", "title-only-remote", "untitled-content-hit"]
+        )
         XCTAssertEqual(
             viewModel.remoteSearchSessions.compactMap(\.sessionId),
-            ["older-history", "title-only-remote"]
+            ["older-history", "title-only-remote", "untitled-content-hit"]
         )
         XCTAssertEqual(
             viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).compactMap(\.sessionId),
-            ["older-history", "title-only-remote"]
+            ["older-history", "title-only-remote", "untitled-content-hit"]
         )
         XCTAssertEqual(
             viewModel.visibleSessions(searchText: "needle", selectedProjectID: "project-archive").compactMap(\.sessionId),
@@ -2211,6 +2232,48 @@ final class SessionListMutationTests: XCTestCase {
             viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).isEmpty
         )
         XCTAssertEqual(viewModel.sessions.compactMap(\.sessionId), ["recent-only"])
+    }
+
+    @MainActor
+    func testArchivingRemoteHistoryHitRemovesItFromActiveSearch() async throws {
+        var archiveRequestCount = 0
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/sessions/search":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "older-history", "title": "Older hit", "match_type": "content"}
+                  ],
+                  "query": "needle",
+                  "count": 1
+                }
+                """, for: request)
+            case "/api/session/archive":
+                archiveRequestCount += 1
+                let body = try XCTUnwrap(apiTestJSONBody(from: request))
+                XCTAssertEqual(body["session_id"] as? String, "older-history")
+                XCTAssertEqual(body["archived"] as? Bool, true)
+                return apiTestJSONResponse(#"{"ok": true}"#, for: request)
+            case "/api/sessions":
+                // The normal cockpit endpoint excludes archived rows.
+                return apiTestJSONResponse(#"{"sessions": [], "archived_count": 1}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.searchSessions(query: "needle", debounceNanoseconds: 0)
+        let remoteHit = try XCTUnwrap(viewModel.remoteSearchSessions.first)
+        XCTAssertEqual(viewModel.remoteSearchSessionIDs, ["older-history"])
+
+        let didArchive = await viewModel.archive(remoteHit)
+
+        XCTAssertTrue(didArchive)
+        XCTAssertEqual(archiveRequestCount, 1)
+        XCTAssertTrue(viewModel.remoteSearchSessionIDs.isEmpty)
+        XCTAssertTrue(viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).isEmpty)
     }
 
     @MainActor

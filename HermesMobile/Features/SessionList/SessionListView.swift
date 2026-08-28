@@ -915,7 +915,11 @@ struct SessionListView: View {
     }
 
     private var remoteSearchTaskID: SessionSearchTaskID {
-        SessionSearchTaskID(query: normalizedSearchText, isViewingCachedData: viewModel.isViewingCachedData)
+        SessionSearchTaskID(
+            query: normalizedSearchText,
+            activeProfileName: viewModel.activeProfileName,
+            isViewingCachedData: viewModel.isViewingCachedData
+        )
     }
 
     private var activeSessionMonitorTaskID: ActiveSessionMonitorTaskID {
@@ -1426,6 +1430,7 @@ enum SessionListUtilityDestination: Hashable, Identifiable {
 
 private struct SessionSearchTaskID: Hashable {
     let query: String
+    let activeProfileName: String?
     let isViewingCachedData: Bool
 }
 

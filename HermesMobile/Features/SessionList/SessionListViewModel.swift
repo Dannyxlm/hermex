@@ -84,6 +84,8 @@ final class SessionListViewModel {
     /// bloating the bounded recent cockpit list.
     private(set) var remoteSearchSessions: [SessionSummary] = []
     private var activeRemoteSearchQuery: String?
+    private var activeRemoteSearchRequestID: UUID?
+    private var knownArchivedSessionIDs: Set<String> = []
 
     /// Stable session IDs for the active remote full-history payload.
     var remoteSearchSessionIDs: [String] {
@@ -195,7 +197,7 @@ final class SessionListViewModel {
 
             let candidate = localSessionsByID[sessionID] ?? remoteSession
             guard candidate.archived != true else { return nil }
-            guard candidate.shouldAppearInSessionList else { return nil }
+            guard !knownArchivedSessionIDs.contains(sessionID) else { return nil }
             guard automatedVisibility.shows(candidate) else { return nil }
             if let selectedProjectID {
                 guard candidate.projectId == selectedProjectID else { return nil }
@@ -244,6 +246,16 @@ final class SessionListViewModel {
         do {
             let response = try await client.sessions()
             let responseSessions = response.sessions ?? []
+            let activeResponseIDs: Set<String> = Set(responseSessions.compactMap { session in
+                guard session.archived != true else { return nil }
+                return Self.nonEmpty(session.sessionId)
+            })
+            let archivedResponseIDs: Set<String> = Set(responseSessions.compactMap { session in
+                guard session.archived == true else { return nil }
+                return Self.nonEmpty(session.sessionId)
+            })
+            knownArchivedSessionIDs.subtract(activeResponseIDs)
+            knownArchivedSessionIDs.formUnion(archivedResponseIDs)
             let visibleSessions = responseSessions
                 .filter {
                     Self.nonEmpty($0.sessionId) != nil
@@ -371,31 +383,35 @@ final class SessionListViewModel {
         debounceNanoseconds: UInt64 = 350_000_000
     ) async {
         let query = Self.normalizedSearchQuery(rawQuery)
+        let requestID = UUID()
+        activeRemoteSearchRequestID = requestID
         activeRemoteSearchQuery = query
         remoteSearchSessions = []
         searchErrorMessage = nil
+        isSearchingRemoteSessions = false
 
-        guard !query.isEmpty, !isViewingCachedData else {
-            isSearchingRemoteSessions = false
-            return
-        }
+        guard !query.isEmpty, !isViewingCachedData else { return }
 
         do {
             if debounceNanoseconds > 0 {
                 try await Task.sleep(nanoseconds: debounceNanoseconds)
             }
 
-            guard !Task.isCancelled, activeRemoteSearchQuery == query else { return }
+            guard !Task.isCancelled, activeRemoteSearchRequestID == requestID else { return }
 
             isSearchingRemoteSessions = true
+            defer {
+                if activeRemoteSearchRequestID == requestID {
+                    isSearchingRemoteSessions = false
+                }
+            }
             let response = try await client.searchSessions(query: query, content: content, depth: depth)
 
-            guard !Task.isCancelled, activeRemoteSearchQuery == query else { return }
+            guard !Task.isCancelled, activeRemoteSearchRequestID == requestID else { return }
 
             remoteSearchSessions = remoteMatchSessions(from: response.sessions ?? [])
-            isSearchingRemoteSessions = false
         } catch {
-            guard activeRemoteSearchQuery == query else { return }
+            guard activeRemoteSearchRequestID == requestID else { return }
 
             isSearchingRemoteSessions = false
             guard !isCancellationError(error) else { return }
@@ -407,6 +423,7 @@ final class SessionListViewModel {
     }
 
     func clearSearchResults() {
+        activeRemoteSearchRequestID = nil
         activeRemoteSearchQuery = nil
         remoteSearchSessions = []
         searchErrorMessage = nil
@@ -531,9 +548,14 @@ final class SessionListViewModel {
         guard beginSessionMutation(sessionId) else { return false }
         defer { endSessionMutation(sessionId) }
 
-        return await mutate(modelContext: modelContext, animation: animation) {
+        let didArchive = await mutate(modelContext: modelContext, animation: animation) {
             try await sessionMutator.archive(sessionID: sessionId)
         }
+        if didArchive {
+            knownArchivedSessionIDs.insert(sessionId)
+            removeRemoteSearchSession(id: sessionId)
+        }
+        return didArchive
     }
 
     func delete(
@@ -549,9 +571,13 @@ final class SessionListViewModel {
         guard beginSessionMutation(sessionId) else { return false }
         defer { endSessionMutation(sessionId) }
 
-        return await mutate(modelContext: modelContext, animation: animation) {
+        let didDelete = await mutate(modelContext: modelContext, animation: animation) {
             try await sessionMutator.delete(sessionID: sessionId)
         }
+        if didDelete {
+            removeRemoteSearchSession(id: sessionId)
+        }
+        return didDelete
     }
 
     func isMutating(_ session: SessionSummary) -> Bool {
@@ -1047,6 +1073,7 @@ final class SessionListViewModel {
                   matchType == "content" || matchType == "title",
                   let sessionID = Self.nonEmpty(session.sessionId),
                   session.archived != true,
+                  !knownArchivedSessionIDs.contains(sessionID),
                   !seenSessionIDs.contains(sessionID)
             else {
                 return nil
@@ -1055,6 +1082,10 @@ final class SessionListViewModel {
             seenSessionIDs.insert(sessionID)
             return session
         }
+    }
+
+    private func removeRemoteSearchSession(id sessionID: String) {
+        remoteSearchSessions.removeAll { Self.nonEmpty($0.sessionId) == sessionID }
     }
 
     private func timestamp(for session: SessionSummary) -> Double {
@@ -1112,6 +1143,11 @@ final class SessionListViewModel {
 
         let profileName = response.effectiveDefaultProfileName
         let profile = response.profile(matching: profileName) ?? fallbackProfile
+
+        if activeProfileName != profileName {
+            knownArchivedSessionIDs.removeAll()
+            clearSearchResults()
+        }
 
         activeProfileName = profileName
         activeProfileDisplayName = response.displayName(for: profileName)
