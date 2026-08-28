@@ -179,6 +179,33 @@ struct SessionStatusResponse: Decodable, Equatable {
     let error: String?
 }
 
+struct SessionAttentionSummary: Decodable, Equatable, Hashable {
+    let kind: String?
+    let count: Int?
+    let severity: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind, count, severity
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = container.decodeLossyStringIfPresent(forKey: .kind)
+        count = container.decodeLossyIntIfPresent(forKey: .count)
+        severity = container.decodeLossyStringIfPresent(forKey: .severity)
+    }
+
+    var requiresUserAction: Bool {
+        guard (count ?? 1) > 0 else { return false }
+        switch kind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "approval", "clarify":
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
     var id: String {
         if let sessionId, !sessionId.isEmpty {
@@ -222,6 +249,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
     let readOnly: Bool?
     let isReadOnly: Bool?
     let matchType: String?
+    let attention: SessionAttentionSummary?
 
     init(
         sessionId: String? = nil,
@@ -255,7 +283,8 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         relationshipType: String? = nil,
         readOnly: Bool? = nil,
         isReadOnly: Bool? = nil,
-        matchType: String? = nil
+        matchType: String? = nil,
+        attention: SessionAttentionSummary? = nil
     ) {
         self.sessionId = sessionId
         self.title = title
@@ -289,6 +318,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         self.readOnly = readOnly
         self.isReadOnly = isReadOnly
         self.matchType = matchType
+        self.attention = attention
     }
 
     enum CodingKeys: String, CodingKey {
@@ -299,7 +329,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         case activeStreamId, isStreaming, isCliSession
         case userMessageCount, hasPendingUserMessage, pendingStartedAt, worktreePath
         case sourceTag, rawSource, sessionSource, sourceLabel
-        case parentSessionId, relationshipType, readOnly, isReadOnly, matchType
+        case parentSessionId, relationshipType, readOnly, isReadOnly, matchType, attention
     }
 
     /// Lossy field by field, like `SessionDetail` and `ProjectSummary` already
@@ -346,6 +376,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         readOnly = container.decodeLossyBoolIfPresent(forKey: .readOnly)
         isReadOnly = container.decodeLossyBoolIfPresent(forKey: .isReadOnly)
         matchType = container.decodeLossyStringIfPresent(forKey: .matchType)
+        attention = try? container.decodeIfPresent(SessionAttentionSummary.self, forKey: .attention)
     }
 
     /// Decodes a session array a row at a time, so one unreadable row costs that
@@ -408,6 +439,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         readOnly = detail.readOnly
         isReadOnly = detail.isReadOnly
         matchType = nil
+        attention = nil
     }
 
     /// Mirrors all stored fields so local title patches preserve session-list metadata.
@@ -445,7 +477,8 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
             relationshipType: relationshipType,
             readOnly: readOnly,
             isReadOnly: isReadOnly,
-            matchType: matchType
+            matchType: matchType,
+            attention: attention
         )
     }
 }

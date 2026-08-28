@@ -573,7 +573,8 @@ struct SessionInteractiveRow: View {
                 session: session,
                 showsMessageCount: showsMessageCount,
                 showsWorkspace: showsWorkspace,
-                isViewingCachedData: viewModel.isViewingCachedData
+                isViewingCachedData: viewModel.isViewingCachedData,
+                showsUnseenCompletion: viewModel.hasUnseenCompletion(session)
             )
         }
         .buttonStyle(.plain)

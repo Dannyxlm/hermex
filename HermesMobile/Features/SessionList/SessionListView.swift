@@ -1065,7 +1065,8 @@ struct SessionListView: View {
 
             let refreshResult = await viewModel.refreshActiveSessionStatesIfNeeded(
                 streamIDs: taskID.streamIDs,
-                modelContext: modelContext
+                modelContext: modelContext,
+                viewedSessionID: navigationState.selectedSessionID
             )
             if refreshResult == .reloaded || refreshResult == .failed {
                 handleLastError()
@@ -1088,7 +1089,10 @@ struct SessionListView: View {
     }
 
     private func loadSessions() async {
-        await viewModel.load(modelContext: modelContext)
+        await viewModel.load(
+            modelContext: modelContext,
+            viewedSessionID: navigationState.selectedSessionID
+        )
         guard !Task.isCancelled else { return }
         handleLastError()
 
@@ -1280,6 +1284,7 @@ struct SessionListView: View {
     }
 
     private func selectSession(_ session: SessionSummary) {
+        viewModel.markSessionOpened(session)
         navigationState.select(session)
         persistLastSelectedSession()
     }
@@ -1300,6 +1305,10 @@ struct SessionListView: View {
             clearsMissingSelection: viewModel.sessionLoadError == nil,
             pendingDeepLinkedSessionID: pendingDeepLinkedSessionID
         )
+        if let selectedSessionID = navigationState.selectedSessionID,
+           let selectedSession = viewModel.sessions.first(where: { $0.sessionId == selectedSessionID }) {
+            viewModel.markSessionOpened(selectedSession)
+        }
         persistLastSelectedSession()
     }
 

@@ -96,6 +96,38 @@ final class APIClientSessionListTests: APIClientTestCase {
         XCTAssertFalse(sessions[2].isSessionReadOnly)
     }
 
+    func testSessionsDecodesExplicitAttentionMetadataTolerantly() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.url?.path, "/api/sessions")
+            return apiTestJSONResponse("""
+            {
+              "sessions": [
+                {
+                  "session_id": "needs-answer",
+                  "attention": {
+                    "kind": "clarify",
+                    "count": 2,
+                    "severity": "question"
+                  }
+                },
+                {
+                  "session_id": "older-server-row"
+                }
+              ]
+            }
+            """, for: request)
+        }
+
+        let response = try await client.sessions()
+        let sessions = try XCTUnwrap(response.sessions)
+
+        XCTAssertEqual(sessions[0].attention?.kind, "clarify")
+        XCTAssertEqual(sessions[0].attention?.count, 2)
+        XCTAssertEqual(sessions[0].attention?.severity, "question")
+        XCTAssertTrue(sessions[0].attention?.requiresUserAction == true)
+        XCTAssertNil(sessions[1].attention)
+    }
+
     func testSessionsIncludeArchivedBuildsQueryAndDecodesMergedRows() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "GET")

@@ -101,6 +101,33 @@ final class SessionIdentityTests: XCTestCase {
         )
     }
 
+    func testSessionRowAccessibilityDistinguishesUnseenReplyFromYourTurn() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let session = try decoder.decode(
+            SessionSummary.self,
+            from: Data("""
+            {
+              "session_id": "needs-reply",
+              "attention": {
+                "kind": "clarify",
+                "count": 1,
+                "severity": "question"
+              }
+            }
+            """.utf8)
+        )
+
+        XCTAssertEqual(
+            SessionRowView.accessibilityStateLabels(
+                for: session,
+                isViewingCachedData: false,
+                showsUnseenCompletion: true
+            ),
+            ["Unseen reply", "Your turn"]
+        )
+    }
+
     func testSessionSummaryFallbackIDIsDeterministicWithoutSessionID() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

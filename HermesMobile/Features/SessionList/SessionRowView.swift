@@ -9,11 +9,15 @@ struct SessionRowView: View {
     var showsMessageCount = true
     var showsWorkspace = true
     var isViewingCachedData = false
+    var showsUnseenCompletion = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             if Self.isActiveStreaming(session) {
                 ActiveSessionStreamingIndicator()
+                    .padding(.top, streamingIndicatorTopPadding)
+            } else if showsUnseenCompletion {
+                UnseenCompletionIndicator()
                     .padding(.top, streamingIndicatorTopPadding)
             }
 
@@ -54,7 +58,8 @@ struct SessionRowView: View {
 
     static func accessibilityStateLabels(
         for session: SessionSummary,
-        isViewingCachedData: Bool
+        isViewingCachedData: Bool,
+        showsUnseenCompletion: Bool = false
     ) -> [String] {
         var labels: [String] = []
 
@@ -64,6 +69,14 @@ struct SessionRowView: View {
 
         if session.pinned == true {
             labels.append(String(localized: "Pinned"))
+        }
+
+        if showsUnseenCompletion {
+            labels.append(String(localized: "Unseen reply"))
+        }
+
+        if session.attention?.requiresUserAction == true {
+            labels.append(String(localized: "Your turn"))
         }
 
         if isViewingCachedData {
@@ -214,6 +227,10 @@ struct SessionRowView: View {
             badges.append(.streaming)
         }
 
+        if session.attention?.requiresUserAction == true {
+            badges.append(.needsReply)
+        }
+
         if isViewingCachedData {
             badges.append(.cached)
         }
@@ -258,7 +275,13 @@ struct SessionRowView: View {
     private var accessibilitySummary: String {
         var parts = [displayTitle]
 
-        parts.append(contentsOf: Self.accessibilityStateLabels(for: session, isViewingCachedData: isViewingCachedData))
+        parts.append(
+            contentsOf: Self.accessibilityStateLabels(
+                for: session,
+                isViewingCachedData: isViewingCachedData,
+                showsUnseenCompletion: showsUnseenCompletion
+            )
+        )
 
         if let metadataLabel {
             parts.append(metadataLabel)
@@ -274,6 +297,7 @@ struct SessionRowView: View {
 
 private enum SessionRowStateBadgeKind: String, Identifiable {
     case streaming
+    case needsReply
     case cached
 
     var id: String { rawValue }
@@ -282,6 +306,8 @@ private enum SessionRowStateBadgeKind: String, Identifiable {
         switch self {
         case .streaming:
             return String(localized: "Live")
+        case .needsReply:
+            return String(localized: "Your turn")
         case .cached:
             return String(localized: "Cached")
         }
@@ -291,6 +317,8 @@ private enum SessionRowStateBadgeKind: String, Identifiable {
         switch self {
         case .streaming:
             return .green
+        case .needsReply:
+            return .orange
         case .cached:
             return .orange
         }
@@ -342,6 +370,15 @@ private struct ActiveSessionStreamingIndicator: View {
         withAnimation(.easeInOut(duration: 0.4).repeatForever(autoreverses: true)) {
             isExpanded = true
         }
+    }
+}
+
+private struct UnseenCompletionIndicator: View {
+    var body: some View {
+        Circle()
+            .fill(Color.accentColor)
+            .frame(width: 9, height: 9)
+            .accessibilityHidden(true)
     }
 }
 

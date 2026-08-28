@@ -78,6 +78,7 @@ final class SessionListViewModel {
     /// (`archived_count`, issue #17). nil until a load succeeds or when an older
     /// server omits the field — the Archived entry stays hidden then.
     private(set) var archivedCount: Int?
+    private(set) var unseenCompletionSessionIDs: Set<String> = []
 
     /// Compact full-history rows from `/api/sessions/search`. Kept separate from
     /// `sessions` so full-history hits can appear during an active search without
@@ -98,12 +99,21 @@ final class SessionListViewModel {
     private let client: APIClient
     private let sessionMutator: SessionMutator
     private let server: URL
+    private let completionAttentionStore: SessionCompletionAttentionStore
 
-    init(server: URL, client: APIClient? = nil) {
+    init(
+        server: URL,
+        client: APIClient? = nil,
+        attentionDefaults: UserDefaults = .standard
+    ) {
         self.server = server
         let resolvedClient = client ?? APIClient(baseURL: server)
         self.client = resolvedClient
         self.sessionMutator = SessionMutator(client: resolvedClient)
+        self.completionAttentionStore = SessionCompletionAttentionStore(
+            server: server,
+            defaults: attentionDefaults
+        )
 
         // Sweep exports leaked by a previous app run (view dismissed while a
         // download was in flight, so the share sheet — and its on-dismiss
@@ -235,7 +245,11 @@ final class SessionListViewModel {
     }
 
     @discardableResult
-    func load(modelContext: ModelContext? = nil, animation: Animation? = nil) async -> Bool {
+    func load(
+        modelContext: ModelContext? = nil,
+        animation: Animation? = nil,
+        viewedSessionID: String? = nil
+    ) async -> Bool {
         isLoading = true
         errorMessage = nil
         cacheErrorMessage = nil
@@ -262,6 +276,10 @@ final class SessionListViewModel {
                         && $0.archived != true
                         && $0.shouldAppearInSessionList
                 }
+            unseenCompletionSessionIDs = completionAttentionStore.reconcile(
+                sessions: visibleSessions,
+                viewedSessionID: viewedSessionID
+            )
             applySessions(visibleSessions, archivedCount: response.archivedCount, animation: animation)
             isViewingCachedData = false
 
@@ -285,6 +303,9 @@ final class SessionListViewModel {
                         .filter(\.shouldAppearInSessionList)
                     if !cachedSessions.isEmpty {
                         sessions = cachedSessions
+                        unseenCompletionSessionIDs = completionAttentionStore.unseenSessionIDs(
+                            in: cachedSessions
+                        )
                         isViewingCachedData = true
                         errorMessage = nil
                     } else {
@@ -437,20 +458,27 @@ final class SessionListViewModel {
     @discardableResult
     func refreshActiveSessionStatesIfNeeded(
         streamIDs rawStreamIDs: [String],
-        modelContext: ModelContext? = nil
+        modelContext: ModelContext? = nil,
+        viewedSessionID: String? = nil
     ) async -> ActiveSessionStateRefreshResult {
         guard !isViewingCachedData, !isLoading else { return .unchanged }
 
         let streamIDs = Self.normalizedStreamIDs(rawStreamIDs)
         guard !streamIDs.isEmpty else {
-            return await load(modelContext: modelContext) ? .reloaded : loadFailureRefreshResult
+            return await load(
+                modelContext: modelContext,
+                viewedSessionID: viewedSessionID
+            ) ? .reloaded : loadFailureRefreshResult
         }
 
         for streamID in streamIDs {
             do {
                 let response = try await client.chatStreamStatus(streamID: streamID)
                 guard response.active == false else { continue }
-                return await load(modelContext: modelContext) ? .reloaded : loadFailureRefreshResult
+                return await load(
+                    modelContext: modelContext,
+                    viewedSessionID: viewedSessionID
+                ) ? .reloaded : loadFailureRefreshResult
             } catch {
                 guard !isCancellationError(error) else { return .unchanged }
                 if case APIError.unauthorized = error {
@@ -554,6 +582,7 @@ final class SessionListViewModel {
             onOperationSuccess: {
                 knownArchivedSessionIDs.insert(sessionId)
                 removeRemoteSearchSession(id: sessionId)
+                clearCompletionAttention(for: session)
             }
         ) {
             try await sessionMutator.archive(sessionID: sessionId)
@@ -578,6 +607,7 @@ final class SessionListViewModel {
             animation: animation,
             onOperationSuccess: {
                 removeRemoteSearchSession(id: sessionId)
+                clearCompletionAttention(for: session)
             }
         ) {
             try await sessionMutator.delete(sessionID: sessionId)
@@ -587,6 +617,21 @@ final class SessionListViewModel {
     func isMutating(_ session: SessionSummary) -> Bool {
         guard let sessionId = Self.nonEmpty(session.sessionId) else { return false }
         return mutatingSessionIDs.contains(sessionId)
+    }
+
+    func hasUnseenCompletion(_ session: SessionSummary) -> Bool {
+        guard let sessionID = Self.nonEmpty(session.sessionId) else { return false }
+        return unseenCompletionSessionIDs.contains(sessionID)
+    }
+
+    func markSessionOpened(_ session: SessionSummary) {
+        completionAttentionStore.markOpened(session)
+        unseenCompletionSessionIDs = completionAttentionStore.unseenSessionIDs(in: sessions)
+    }
+
+    private func clearCompletionAttention(for session: SessionSummary) {
+        completionAttentionStore.clear(session)
+        unseenCompletionSessionIDs = completionAttentionStore.unseenSessionIDs(in: sessions)
     }
 
     func rename(_ session: SessionSummary, to rawTitle: String, modelContext: ModelContext? = nil) async -> Bool {
@@ -1198,4 +1243,137 @@ final class SessionListViewModel {
         return urlError.code == .cancelled
     }
 
+}
+
+private final class SessionCompletionAttentionStore {
+    private struct Snapshot: Codable {
+        let messageCount: Int
+        let lastMessageAt: Double
+    }
+
+    private struct State: Codable {
+        var viewed: [String: Snapshot] = [:]
+        var observedStreaming: [String: Snapshot] = [:]
+        var unread: [String: Snapshot] = [:]
+    }
+
+    private let defaults: UserDefaults
+    private let storageKey: String
+
+    init(server: URL, defaults: UserDefaults) {
+        self.defaults = defaults
+        self.storageKey = "sessionCompletionAttention.v1|\(server.absoluteString)"
+    }
+
+    func reconcile(sessions: [SessionSummary], viewedSessionID: String?) -> Set<String> {
+        var state = load()
+        let viewedSessionID = normalized(viewedSessionID)
+
+        for session in sessions {
+            guard let key = key(for: session), let sessionID = normalized(session.sessionId) else { continue }
+            let snapshot = snapshot(for: session)
+            let isViewed = sessionID == viewedSessionID
+            let isStreaming = session.isStreaming == true
+                || normalized(session.activeStreamId) != nil
+                || session.hasPendingUserMessage == true
+
+            if isViewed {
+                state.viewed[key] = snapshot
+                state.unread.removeValue(forKey: key)
+            }
+
+            if isStreaming {
+                state.observedStreaming[key] = snapshot
+                if state.viewed[key] == nil {
+                    state.viewed[key] = snapshot
+                }
+                continue
+            }
+
+            if state.observedStreaming.removeValue(forKey: key) != nil {
+                if isViewed {
+                    state.viewed[key] = snapshot
+                    state.unread.removeValue(forKey: key)
+                } else {
+                    state.unread[key] = snapshot
+                }
+                continue
+            }
+
+            guard let viewed = state.viewed[key] else {
+                state.viewed[key] = snapshot
+                continue
+            }
+
+            if !isViewed,
+               (snapshot.messageCount > viewed.messageCount
+                    || snapshot.lastMessageAt > viewed.lastMessageAt) {
+                state.unread[key] = snapshot
+            }
+        }
+
+        save(state)
+        return unseenSessionIDs(in: sessions, state: state)
+    }
+
+    func markOpened(_ session: SessionSummary) {
+        guard let key = key(for: session) else { return }
+        var state = load()
+        state.viewed[key] = snapshot(for: session)
+        state.unread.removeValue(forKey: key)
+        save(state)
+    }
+
+    func clear(_ session: SessionSummary) {
+        guard let key = key(for: session) else { return }
+        var state = load()
+        state.viewed.removeValue(forKey: key)
+        state.observedStreaming.removeValue(forKey: key)
+        state.unread.removeValue(forKey: key)
+        save(state)
+    }
+
+    func unseenSessionIDs(in sessions: [SessionSummary]) -> Set<String> {
+        unseenSessionIDs(in: sessions, state: load())
+    }
+
+    private func unseenSessionIDs(in sessions: [SessionSummary], state: State) -> Set<String> {
+        Set(sessions.compactMap { session in
+            guard let key = key(for: session),
+                  state.unread[key] != nil
+            else { return nil }
+            return normalized(session.sessionId)
+        })
+    }
+
+    private func key(for session: SessionSummary) -> String? {
+        guard let sessionID = normalized(session.sessionId) else { return nil }
+        let profile = normalized(session.profile) ?? "default"
+        return "\(profile)|\(sessionID)"
+    }
+
+    private func snapshot(for session: SessionSummary) -> Snapshot {
+        Snapshot(
+            messageCount: max(session.messageCount ?? 0, 0),
+            lastMessageAt: session.lastMessageAt ?? 0
+        )
+    }
+
+    private func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func load() -> State {
+        guard let data = defaults.data(forKey: storageKey),
+              let state = try? JSONDecoder().decode(State.self, from: data)
+        else { return State() }
+        return state
+    }
+
+    private func save(_ state: State) {
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        defaults.set(data, forKey: storageKey)
+    }
 }

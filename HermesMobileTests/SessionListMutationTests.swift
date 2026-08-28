@@ -2931,6 +2931,123 @@ final class SessionListMutationTests: XCTestCase {
     }
 
     @MainActor
+    func testCompletionUnreadPersistsAcrossReloadAndClearsWhenOpened() async throws {
+        let suiteName = "SessionListMutationTests.attention.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        var loadCount = 0
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let client = try makeClient(server: server) { request in
+            XCTAssertEqual(request.url?.path, "/api/sessions")
+            loadCount += 1
+            let streaming = loadCount == 1
+            return apiTestJSONResponse("""
+            {
+              "sessions": [
+                {
+                  "session_id": "session-attention",
+                  "title": "Attention test",
+                  "profile": "default",
+                  "message_count": \(streaming ? 1 : 2),
+                  "last_message_at": \(streaming ? 100 : 200),
+                  "is_streaming": \(streaming ? "true" : "false")
+                }
+              ]
+            }
+            """, for: request)
+        }
+        let viewModel = SessionListViewModel(
+            server: server,
+            client: client,
+            attentionDefaults: defaults
+        )
+
+        await viewModel.load()
+        XCTAssertFalse(viewModel.hasUnseenCompletion(viewModel.sessions[0]))
+
+        await viewModel.load()
+        XCTAssertTrue(viewModel.hasUnseenCompletion(viewModel.sessions[0]))
+
+        viewModel.markSessionOpened(viewModel.sessions[0])
+        XCTAssertFalse(viewModel.hasUnseenCompletion(viewModel.sessions[0]))
+    }
+
+    @MainActor
+    func testViewedSessionDoesNotGainCompletionUnreadWhenItsStreamStops() async throws {
+        let suiteName = "SessionListMutationTests.viewed-attention.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        var loadCount = 0
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let client = try makeClient(server: server) { request in
+            XCTAssertEqual(request.url?.path, "/api/sessions")
+            loadCount += 1
+            return apiTestJSONResponse("""
+            {
+              "sessions": [
+                {
+                  "session_id": "open-session",
+                  "profile": "default",
+                  "message_count": \(loadCount == 1 ? 1 : 2),
+                  "last_message_at": \(loadCount == 1 ? 100 : 200),
+                  "is_streaming": \(loadCount == 1 ? "true" : "false")
+                }
+              ]
+            }
+            """, for: request)
+        }
+        let viewModel = SessionListViewModel(
+            server: server,
+            client: client,
+            attentionDefaults: defaults
+        )
+
+        await viewModel.load(viewedSessionID: "open-session")
+        await viewModel.load(viewedSessionID: "open-session")
+
+        XCTAssertFalse(viewModel.hasUnseenCompletion(viewModel.sessions[0]))
+    }
+
+    @MainActor
+    func testMetadataOnlyUpdateDoesNotCreateCompletionUnread() async throws {
+        let suiteName = "SessionListMutationTests.metadata-attention.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        var loadCount = 0
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let client = try makeClient(server: server) { request in
+            XCTAssertEqual(request.url?.path, "/api/sessions")
+            loadCount += 1
+            return apiTestJSONResponse("""
+            {
+              "sessions": [
+                {
+                  "session_id": "metadata-only",
+                  "profile": "default",
+                  "message_count": 4,
+                  "updated_at": \(loadCount == 1 ? 100 : 200),
+                  "is_streaming": false
+                }
+              ]
+            }
+            """, for: request)
+        }
+        let viewModel = SessionListViewModel(
+            server: server,
+            client: client,
+            attentionDefaults: defaults
+        )
+
+        await viewModel.load()
+        await viewModel.load()
+
+        XCTAssertFalse(viewModel.hasUnseenCompletion(viewModel.sessions[0]))
+    }
+
+    @MainActor
     private func makeViewModel(
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
     ) throws -> SessionListViewModel {
