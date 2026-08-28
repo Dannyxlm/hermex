@@ -1,5 +1,10 @@
 import Foundation
 
+struct SessionDeepLinkTarget: Equatable, Hashable, Sendable {
+    let sessionID: String
+    let streamID: String?
+}
+
 enum HermesDeepLink {
     static var scheme: String {
         Bundle.main.object(forInfoDictionaryKey: "HermesURLScheme") as? String
@@ -88,10 +93,8 @@ enum HermesDeepLink {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    static func sessionURL(sessionID: String) -> URL? {
-        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
+    static func sessionURL(sessionID: String, streamID: String? = nil) -> URL? {
+        guard let sessionID = normalizedValue(sessionID) else { return nil }
 
         var components = URLComponents()
         components.scheme = scheme
@@ -99,10 +102,17 @@ enum HermesDeepLink {
         components.queryItems = [
             URLQueryItem(name: "id", value: sessionID)
         ]
+        if let streamID = normalizedValue(streamID) {
+            components.queryItems?.append(URLQueryItem(name: "stream_id", value: streamID))
+        }
         return components.url
     }
 
     static func sessionID(from url: URL) -> String? {
+        sessionTarget(from: url)?.sessionID
+    }
+
+    static func sessionTarget(from url: URL) -> SessionDeepLinkTarget? {
         guard url.scheme?.lowercased() == scheme,
               url.host?.lowercased() == sessionHost
         else {
@@ -110,19 +120,26 @@ enum HermesDeepLink {
         }
 
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        if let id = components?.queryItems?.first(where: { item in
+        let queryID = components?.queryItems?.first(where: { item in
             item.name == "id" || item.name == "session_id"
-        })?.value {
-            return normalizedSessionID(id)
-        }
-
+        })?.value
         let pathID = url.pathComponents
             .filter { $0 != "/" }
             .first
-        return normalizedSessionID(pathID)
+        guard let sessionID = normalizedValue(queryID) ?? normalizedValue(pathID) else {
+            return nil
+        }
+
+        let streamID = components?.queryItems?.first(where: { item in
+            item.name == "stream_id" || item.name == "stream"
+        })?.value
+        return SessionDeepLinkTarget(
+            sessionID: sessionID,
+            streamID: normalizedValue(streamID)
+        )
     }
 
-    private static func normalizedSessionID(_ rawValue: String?) -> String? {
+    private static func normalizedValue(_ rawValue: String?) -> String? {
         let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
     }

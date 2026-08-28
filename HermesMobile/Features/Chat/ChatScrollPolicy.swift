@@ -79,7 +79,33 @@ enum ChatScrollPolicy {
 /// the system navigation transition. Cache preparation remains synchronous so
 /// an available transcript can participate in the destination's first layout.
 enum ChatInitialAppearancePolicy {
+    /// SwiftUI restarts view-bound tasks when a destination reappears. Once the
+    /// initial load/reconnect owner has completed, later appearances are owned by
+    /// `onAppear` and must not restart the startup pipeline.
+    static func shouldRunInitialTask(hasCompletedInitialStartup: Bool) -> Bool {
+        !hasCompletedInitialStartup
+    }
+
     static func shouldBeginAsyncWork(hasCompletedAppearance: Bool) -> Bool {
         hasCompletedAppearance
+    }
+
+    /// The first appearance is owned by `performInitialAsyncWork`, which loads the
+    /// transcript and then reconnects exactly once. Later appearances may resume a
+    /// deliberately suspended connection without competing with that startup path.
+    static func shouldReconnectOnAppear(hasCompletedInitialStartup: Bool) -> Bool {
+        hasCompletedInitialStartup
+    }
+
+    /// Runs cache-backed transcript/active-stream preparation before the first
+    /// suspension point in chat startup. Draft hydration can touch disk, so it
+    /// must never sit in front of the content that makes the destination useful.
+    @MainActor
+    static func prepareCacheBeforeDraftHydration(
+        prepareCache: () -> Void,
+        hydrateDraft: () async -> Void
+    ) async {
+        prepareCache()
+        await hydrateDraft()
     }
 }

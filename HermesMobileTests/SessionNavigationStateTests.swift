@@ -13,6 +13,60 @@ final class SessionNavigationStateTests: XCTestCase {
         XCTAssertEqual(state.lastSelectedSessionID, "session-1")
     }
 
+    func testSelectingRunningSessionKeepsSidebarActiveStreamAdvisory() {
+        let session = SessionSummary(
+            sessionId: "session-1",
+            title: "One",
+            activeStreamId: "stream-sidebar"
+        )
+        var state = SessionNavigationState()
+
+        state.select(session)
+
+        XCTAssertEqual(state.destination, .session(session))
+        XCTAssertNil(state.selectedStreamID)
+    }
+
+    func testExplicitStreamTargetWinsOverSidebarActiveStream() {
+        let session = SessionSummary(
+            sessionId: "session-1",
+            title: "One",
+            activeStreamId: "stream-sidebar"
+        )
+        var state = SessionNavigationState()
+
+        state.select(session, streamID: "stream-live-activity")
+
+        XCTAssertEqual(state.selectedStreamID, "stream-live-activity")
+    }
+
+    func testStreamScopedReselectionAdvancesNavigationAndRetainsExactStream() {
+        let session = SessionSummary(sessionId: "session-1", title: "One")
+        var state = SessionNavigationState()
+
+        state.select(session, streamID: "stream-123")
+        let firstRevision = state.rootRevision
+
+        state.select(session, streamID: "stream-123")
+
+        XCTAssertEqual(state.destination, .session(session))
+        XCTAssertEqual(state.selectedSessionID, "session-1")
+        XCTAssertEqual(state.selectedStreamID, "stream-123")
+        XCTAssertGreaterThan(state.rootRevision, firstRevision)
+    }
+
+    func testOrdinarySessionSelectionClearsPreviousStreamTarget() {
+        let first = SessionSummary(sessionId: "session-1", title: "One")
+        let second = SessionSummary(sessionId: "session-2", title: "Two")
+        var state = SessionNavigationState()
+
+        state.select(first, streamID: "stream-123")
+        state.select(second)
+
+        XCTAssertEqual(state.destination, .session(second))
+        XCTAssertNil(state.selectedStreamID)
+    }
+
     func testRestoreSelectsStoredSessionWhenItStillExists() {
         let first = SessionSummary(sessionId: "session-1", title: "One")
         let second = SessionSummary(sessionId: "session-2", title: "Two")
@@ -22,6 +76,20 @@ final class SessionNavigationStateTests: XCTestCase {
 
         XCTAssertEqual(state.destination, .session(second))
         XCTAssertEqual(state.lastSelectedSessionID, "session-2")
+    }
+
+    func testRestoreRunningStoredSessionKeepsSidebarActiveStreamAdvisory() {
+        let session = SessionSummary(
+            sessionId: "session-2",
+            title: "Two",
+            activeStreamId: "stream-sidebar"
+        )
+        var state = SessionNavigationState(lastSelectedSessionID: "session-2")
+
+        state.restoreIfNeeded(from: [session])
+
+        XCTAssertEqual(state.destination, .session(session))
+        XCTAssertNil(state.selectedStreamID)
     }
 
     func testRestoreClearsStoredSelectionWhenSessionNoLongerExists() {

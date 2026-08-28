@@ -161,6 +161,122 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
     // MARK: - Toolbar availability
 
     @MainActor
+    func testAvailabilityInitialLoadFetchesOnlyGitInfo() async throws {
+        var requestedPaths: [String] = []
+        let client = makeClient { request in
+            let path = request.url?.path ?? ""
+            requestedPaths.append(path)
+            guard path == "/api/git-info" else {
+                XCTFail("Initial availability must not request full Git details: \(path)")
+                return apiTestJSONResponse("{}", for: request)
+            }
+            return apiTestJSONResponse(#"{"git":{"is_git":true,"branch":"main"}}"#, for: request)
+        }
+        let viewModel = GitWorkspaceAvailabilityViewModel(
+            session: try session(id: "s1"),
+            server: URL(string: "https://example.test")!,
+            apiClient: client
+        )
+
+        await viewModel.load()
+
+        XCTAssertEqual(requestedPaths, ["/api/git-info"])
+        XCTAssertTrue(viewModel.hasRepository)
+        XCTAssertEqual(viewModel.currentBranchName, "main")
+        XCTAssertNil(viewModel.status)
+        XCTAssertNil(viewModel.branches)
+    }
+
+    @MainActor
+    func testAvailabilityDetailsLoadStatusAndBranchesOnlyOnce() async throws {
+        var requestedPaths: [String] = []
+        let client = makeClient { request in
+            let path = request.url?.path ?? ""
+            requestedPaths.append(path)
+            switch path {
+            case "/api/git-info":
+                return apiTestJSONResponse(#"{"git":{"is_git":true,"branch":"main"}}"#, for: request)
+            case "/api/git/status":
+                return apiTestJSONResponse(#"{"git":{"is_git":true,"branch":"main","files":[],"totals":{"changed":0}}}"#, for: request)
+            case "/api/git/branches":
+                return apiTestJSONResponse(#"{"branches":{"is_git":true,"current":"main"}}"#, for: request)
+            default:
+                XCTFail("Unexpected request: \(path)")
+                return apiTestJSONResponse("{}", for: request)
+            }
+        }
+        let viewModel = GitWorkspaceAvailabilityViewModel(
+            session: try session(id: "s1"),
+            server: URL(string: "https://example.test")!,
+            apiClient: client
+        )
+
+        await viewModel.load()
+        await viewModel.loadDetailsIfNeeded()
+        await viewModel.loadDetailsIfNeeded()
+
+        XCTAssertEqual(requestedPaths, ["/api/git-info", "/api/git/status", "/api/git/branches"])
+        XCTAssertEqual(viewModel.status?.changedCount, 0)
+        XCTAssertEqual(viewModel.branches?.current, "main")
+    }
+
+    @MainActor
+    func testAvailabilityDetailsRetryWhenBranchLoadWasAlreadyInFlight() async throws {
+        let firstBranchRequestStarted = expectation(description: "first branch request started")
+        let deferredBranchResponse = DeferredGitBranchResponse()
+        let requestCounts = GitDetailRequestCounts()
+        DeferredGitURLProtocol.requestHandler = { protocolInstance, request in
+            switch request.url?.path {
+            case "/api/git-info":
+                protocolInstance.succeed(#"{"git":{"is_git":true,"branch":"main"}}"#)
+            case "/api/git/status":
+                requestCounts.incrementStatus()
+                protocolInstance.succeed(#"{"git":{"is_git":true,"branch":"main","files":[],"totals":{"changed":0}}}"#)
+            case "/api/git/branches":
+                let requestNumber = requestCounts.incrementBranches()
+                if requestNumber == 1 {
+                    deferredBranchResponse.store {
+                        protocolInstance.succeed(#"{"branches":{"is_git":true,"current":"main"}}"#)
+                    }
+                    firstBranchRequestStarted.fulfill()
+                } else {
+                    protocolInstance.succeed(#"{"branches":{"is_git":true,"current":"main"}}"#)
+                }
+            default:
+                protocolInstance.fail(URLError(.badURL))
+            }
+        }
+        defer { DeferredGitURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DeferredGitURLProtocol.self]
+        let client = APIClient(
+            baseURL: URL(string: "https://example.test")!,
+            session: URLSession(configuration: configuration)
+        )
+        let viewModel = GitWorkspaceAvailabilityViewModel(
+            session: try session(id: "s1"),
+            server: URL(string: "https://example.test")!,
+            apiClient: client
+        )
+
+        await viewModel.load()
+        let firstBranchLoad = Task { @MainActor in
+            await viewModel.loadBranches()
+        }
+        await fulfillment(of: [firstBranchRequestStarted], timeout: 5)
+
+        await viewModel.loadDetailsIfNeeded()
+        deferredBranchResponse.complete()
+        await firstBranchLoad.value
+
+        await viewModel.loadDetailsIfNeeded()
+
+        XCTAssertEqual(requestCounts.status, 2)
+        XCTAssertEqual(requestCounts.branches, 2)
+    }
+
+    @MainActor
     func testAvailabilityShowsOnlyWhenGitInfoConfirmsRepository() async throws {
         let client = makeClient { request in
             if request.url?.path == "/api/git-info" {
@@ -179,7 +295,8 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         await viewModel.load()
 
         XCTAssertTrue(viewModel.hasRepository)
-        XCTAssertEqual(viewModel.status?.changedCount, 0)
+        XCTAssertNil(viewModel.status, "Repository availability must not pull full status on chat open.")
+        XCTAssertNil(viewModel.branches)
         XCTAssertNil(viewModel.lastError)
     }
 
@@ -193,9 +310,18 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         let dirty = try info(#"{"git":{"is_git":true,"dirty":2,"behind":0}}"#)
         let behind = try info(#"{"git":{"is_git":true,"dirty":0,"behind":1}}"#)
         let clean = try info(#"{"git":{"is_git":true,"dirty":0,"behind":0}}"#)
+        let changedStatus = try decoder.decode(
+            GitStatusResponse.self,
+            from: Data(Self.statusWithOneFile.utf8)
+        ).git
 
         XCTAssertEqual(GitToolbarPresentation(hasRepository: true, isLoading: false, info: dirty, status: nil, statusFailed: false).statusDot, .gray)
         XCTAssertEqual(GitToolbarPresentation(hasRepository: true, isLoading: false, info: behind, status: nil, statusFailed: false).statusDot, .gray)
+        XCTAssertEqual(GitToolbarPresentation(hasRepository: true, isLoading: false, info: clean, status: changedStatus, statusFailed: false).statusDot, .gray)
+        XCTAssertEqual(
+            GitToolbarPresentation(hasRepository: true, isLoading: false, info: clean, status: changedStatus, statusFailed: false).accessibilityValue,
+            "Local repository has uncommitted changes"
+        )
         XCTAssertNil(GitToolbarPresentation(hasRepository: true, isLoading: false, info: clean, status: nil, statusFailed: false).statusDot)
         XCTAssertNil(GitToolbarPresentation(hasRepository: false, isLoading: false, info: dirty, status: nil, statusFailed: false).statusDot)
     }
@@ -275,7 +401,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
 
         await viewModel.loadIfNeeded()
 
-        XCTAssertEqual(requestCount, 4, "Successful availability also loads menu status and branches.")
+        XCTAssertEqual(requestCount, 2, "Retrying availability still performs only the lightweight Git probe.")
         XCTAssertTrue(viewModel.hasRepository)
         XCTAssertNil(viewModel.lastError)
     }
@@ -289,6 +415,9 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
             if request.url?.path == "/api/git-info" {
                 return apiTestJSONResponse(#"{"git": {"is_git": true, "branch": "main"}}"#, for: request)
             }
+            if request.url?.path == "/api/git/branches" {
+                return apiTestJSONResponse(#"{"branches":{"is_git":true,"current":"main"}}"#, for: request)
+            }
             if statusShouldFail {
                 statusShouldFail = false
                 let response = HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!
@@ -300,12 +429,15 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
 
         await viewModel.loadIfNeeded()
         XCTAssertTrue(viewModel.hasRepository)
+        XCTAssertNil(viewModel.statusError)
+
+        await viewModel.loadDetailsIfNeeded()
         XCTAssertNil(viewModel.status)
         XCTAssertNotNil(viewModel.statusError)
 
-        await viewModel.loadIfNeeded()
+        await viewModel.loadDetailsIfNeeded()
 
-        XCTAssertEqual(requestCount, 5)
+        XCTAssertEqual(requestCount, 4)
         XCTAssertEqual(viewModel.status?.changedCount, 0)
         XCTAssertNil(viewModel.statusError)
     }
@@ -338,6 +470,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         )
 
         await viewModel.load()
+        await viewModel.loadDetailsIfNeeded()
         XCTAssertEqual(viewModel.branches?.local?.compactMap(\.name), ["main", "feature"])
 
         let outcome = await viewModel.checkout(GitCheckoutTarget(ref: "feature", mode: .local))
@@ -587,6 +720,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         let client = commitPipelineClient { paths.append($0) }
         let vm = GitWorkspaceAvailabilityViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
         await vm.load()
+        await vm.loadDetailsIfNeeded()
         XCTAssertTrue(vm.hasCommittableChanges)
 
         let outcome = await vm.quickCommit(push: true) { phases.append($0) }
@@ -608,6 +742,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         let client = commitPipelineClient { paths.append($0) }
         let vm = GitWorkspaceAvailabilityViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
         await vm.load()
+        await vm.loadDetailsIfNeeded()
 
         let outcome = await vm.quickCommit(push: false)
 
@@ -622,6 +757,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         let client = commitPipelineClient(pushStatus: 500) { paths.append($0) }
         let vm = GitWorkspaceAvailabilityViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
         await vm.load()
+        await vm.loadDetailsIfNeeded()
 
         let outcome = await vm.quickCommit(push: true)
 
@@ -648,6 +784,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         }
         let vm = GitWorkspaceAvailabilityViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
         await vm.load()
+        await vm.loadDetailsIfNeeded()
 
         let outcome = await vm.quickCommit(push: true)
         XCTAssertEqual(outcome, .nothingToCommit)
@@ -664,6 +801,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
             let client = commitPipelineClient(truncated: true) { paths.append($0) }
             let vm = GitWorkspaceAvailabilityViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
             await vm.load()
+            await vm.loadDetailsIfNeeded()
             XCTAssertEqual(vm.status?.truncated, true)
             XCTAssertTrue(vm.hasCommittableChanges)
 
@@ -684,6 +822,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         let client = commitPipelineClient(stageStatus: 403)
         let vm = GitWorkspaceAvailabilityViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
         await vm.load()
+        await vm.loadDetailsIfNeeded()
 
         let outcome = await vm.quickCommit(push: true)
         XCTAssertEqual(outcome, .failure)
@@ -707,12 +846,127 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         }
         let vm = GitWorkspaceAvailabilityViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
         await vm.load()
+        await vm.loadDetailsIfNeeded()
         XCTAssertEqual(vm.status?.changedCount, 1)
 
         changed = false
         await vm.refreshAfterExternalMutation()
 
         XCTAssertEqual(vm.status?.changedCount, 0, "Refreshing after an agent turn surfaces the new working-tree state.")
+    }
+
+    @MainActor
+    func testRefreshAfterExternalMutationInvalidatesStaleDetailsWhenStatusRefreshFails() async throws {
+        var shouldFailStatus = false
+        var changed = true
+        var statusRequestCount = 0
+        let client = makeClient { request in
+            switch request.url?.path {
+            case "/api/git-info":
+                return apiTestJSONResponse(#"{"git":{"is_git":true,"branch":"main"}}"#, for: request)
+            case "/api/git/branches":
+                return apiTestJSONResponse(#"{"branches":{"is_git":true,"current":"main"}}"#, for: request)
+            case "/api/git/status":
+                statusRequestCount += 1
+                if shouldFailStatus {
+                    let response = HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 500,
+                        httpVersion: nil,
+                        headerFields: ["Content-Type": "application/json"]
+                    )!
+                    return (response, Data(#"{"error":"status unavailable"}"#.utf8))
+                }
+                let json = changed
+                    ? Self.statusWithOneFile
+                    : #"{"git":{"is_git":true,"branch":"main","files":[],"totals":{"changed":0}}}"#
+                return apiTestJSONResponse(json, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+        let vm = GitWorkspaceAvailabilityViewModel(
+            session: try session(id: "s1"),
+            server: URL(string: "https://example.test")!,
+            apiClient: client
+        )
+        await vm.load()
+        await vm.loadDetailsIfNeeded()
+        XCTAssertEqual(vm.status?.changedCount, 1)
+        XCTAssertEqual(statusRequestCount, 1)
+
+        shouldFailStatus = true
+        await vm.refreshAfterExternalMutation()
+
+        XCTAssertNil(vm.status, "A failed post-mutation refresh must not leave stale changes actionable")
+        XCTAssertNotNil(vm.statusError)
+        XCTAssertEqual(statusRequestCount, 2)
+
+        shouldFailStatus = false
+        changed = false
+        await vm.loadDetailsIfNeeded()
+
+        XCTAssertEqual(vm.status?.changedCount, 0)
+        XCTAssertNil(vm.statusError)
+        XCTAssertEqual(statusRequestCount, 3, "Opening Git again must retry the failed detail load")
+    }
+
+    @MainActor
+    func testRefreshAfterExternalMutationInvalidatesStaleBranchesWhenBranchRefreshFails() async throws {
+        var shouldFailBranches = false
+        var currentBranch = "main"
+        var branchRequestCount = 0
+        let client = makeClient { request in
+            switch request.url?.path {
+            case "/api/git-info":
+                return apiTestJSONResponse(#"{"git":{"is_git":true,"branch":"\#(currentBranch)"}}"#, for: request)
+            case "/api/git/status":
+                return apiTestJSONResponse(#"{"git":{"is_git":true,"branch":"\#(currentBranch)","files":[],"totals":{"changed":0}}}"#, for: request)
+            case "/api/git/branches":
+                branchRequestCount += 1
+                if shouldFailBranches {
+                    let response = HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 500,
+                        httpVersion: nil,
+                        headerFields: ["Content-Type": "application/json"]
+                    )!
+                    return (response, Data(#"{"error":"branches unavailable"}"#.utf8))
+                }
+                return apiTestJSONResponse(
+                    #"{"branches":{"is_git":true,"current":"\#(currentBranch)","local":[{"name":"\#(currentBranch)"}],"remote":[]}}"#,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+        let vm = GitWorkspaceAvailabilityViewModel(
+            session: try session(id: "s1"),
+            server: URL(string: "https://example.test")!,
+            apiClient: client
+        )
+        await vm.load()
+        await vm.loadDetailsIfNeeded()
+        XCTAssertEqual(vm.branches?.current, "main")
+        XCTAssertEqual(branchRequestCount, 1)
+
+        currentBranch = "feature"
+        shouldFailBranches = true
+        await vm.refreshAfterExternalMutation()
+
+        XCTAssertNil(vm.branches, "A failed post-mutation refresh must not leave stale branch refs actionable")
+        XCTAssertNotNil(vm.branchesError)
+        XCTAssertEqual(branchRequestCount, 2)
+
+        shouldFailBranches = false
+        await vm.loadDetailsIfNeeded()
+
+        XCTAssertEqual(vm.branches?.current, "feature")
+        XCTAssertNil(vm.branchesError)
+        XCTAssertEqual(branchRequestCount, 3, "Opening Git again must retry the failed branch detail load")
     }
 
     // MARK: - Advanced staging sheet view model (GitCommitViewModel)
@@ -909,5 +1163,97 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         await vm.discardSelectedOrAll(deleteUntracked: false)
 
         XCTAssertEqual(calls, ["/api/git/discard"], "No staged targets means no unstage call.")
+    }
+}
+
+private final class GitDetailRequestCounts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var statusValue = 0
+    private var branchesValue = 0
+
+    var status: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return statusValue
+    }
+
+    var branches: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return branchesValue
+    }
+
+    func incrementStatus() {
+        lock.lock()
+        statusValue += 1
+        lock.unlock()
+    }
+
+    @discardableResult
+    func incrementBranches() -> Int {
+        lock.lock()
+        branchesValue += 1
+        let value = branchesValue
+        lock.unlock()
+        return value
+    }
+}
+
+private final class DeferredGitBranchResponse: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completion: (() -> Void)?
+
+    func store(_ completion: @escaping () -> Void) {
+        lock.lock()
+        self.completion = completion
+        lock.unlock()
+    }
+
+    func complete() {
+        lock.lock()
+        let completion = completion
+        self.completion = nil
+        lock.unlock()
+        completion?()
+    }
+}
+
+private final class DeferredGitURLProtocol: URLProtocol {
+    static var requestHandler: ((DeferredGitURLProtocol, URLRequest) -> Void)?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let requestHandler = Self.requestHandler else {
+            fail(URLError(.badServerResponse))
+            return
+        }
+        requestHandler(self, request)
+    }
+
+    override func stopLoading() {}
+
+    func succeed(_ json: String, statusCode: Int = 200) {
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+              )
+        else {
+            fail(URLError(.badServerResponse))
+            return
+        }
+
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(json.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    func fail(_ error: Error) {
+        client?.urlProtocol(self, didFailWithError: error)
     }
 }

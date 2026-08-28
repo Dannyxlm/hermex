@@ -7,7 +7,7 @@ struct ContentView: View {
     @State private var pendingSharedImport: SharedImportReservation?
     @State private var hasWaitingSharedImport = false
     @State private var hasRoutedSharedImport = false
-    @State private var pendingDeepLinkedSessionID: String?
+    @State private var pendingDeepLinkedSessionTarget: SessionDeepLinkTarget?
     @State private var pendingNewChatRequest: NewChatRequest?
     @State private var didCheckInitialPendingShare = false
     @State private var intentRouter = AppIntentRouter.shared
@@ -67,7 +67,7 @@ struct ContentView: View {
                 didRoutePendingSharedImport: consumePendingSharedImport,
                 hasWaitingSharedImport: hasWaitingSharedImport,
                 openNextSharedImport: openNextSharedImport,
-                pendingDeepLinkedSessionID: $pendingDeepLinkedSessionID,
+                pendingDeepLinkedSessionTarget: $pendingDeepLinkedSessionTarget,
                 requestedNewChat: $pendingNewChatRequest
             )
             // Switching the active server keeps us in `.loggedIn`, so without a
@@ -103,8 +103,8 @@ struct ContentView: View {
             return
         }
 
-        if let sessionID = HermesDeepLink.sessionID(from: url) {
-            pendingDeepLinkedSessionID = sessionID
+        if let target = HermesDeepLink.sessionTarget(from: url) {
+            pendingDeepLinkedSessionTarget = target
             return
         }
 

@@ -204,6 +204,50 @@ final class LiveActivityTests: XCTestCase {
         XCTAssertNil(HermesDeepLink.sessionID(from: HermesShareDraft.openURL))
     }
 
+    func testBuildsAndParsesStreamScopedSessionDeepLink() throws {
+        let url = try XCTUnwrap(
+            HermesDeepLink.sessionURL(
+                sessionID: "session-abc",
+                streamID: "stream-123"
+            )
+        )
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+
+        XCTAssertEqual(
+            components?.queryItems,
+            [
+                URLQueryItem(name: "id", value: "session-abc"),
+                URLQueryItem(name: "stream_id", value: "stream-123")
+            ]
+        )
+        XCTAssertEqual(
+            HermesDeepLink.sessionTarget(from: url),
+            SessionDeepLinkTarget(
+                sessionID: "session-abc",
+                streamID: "stream-123"
+            )
+        )
+        XCTAssertEqual(HermesDeepLink.sessionID(from: url), "session-abc")
+    }
+
+    func testLegacySessionDeepLinksParseWithoutAStreamTarget() throws {
+        let queryURL = try XCTUnwrap(
+            URL(string: "\(HermesDeepLink.scheme)://session?id=legacy-session")
+        )
+        let pathURL = try XCTUnwrap(
+            URL(string: "\(HermesDeepLink.scheme)://session/path-session")
+        )
+
+        XCTAssertEqual(
+            HermesDeepLink.sessionTarget(from: queryURL),
+            SessionDeepLinkTarget(sessionID: "legacy-session", streamID: nil)
+        )
+        XCTAssertEqual(
+            HermesDeepLink.sessionTarget(from: pathURL),
+            SessionDeepLinkTarget(sessionID: "path-session", streamID: nil)
+        )
+    }
+
     func testSessionDeepLinkURLPercentEncodesSessionID() throws {
         let sessionID = "session & /?=✓"
         let url = try XCTUnwrap(HermesDeepLink.sessionURL(sessionID: sessionID))

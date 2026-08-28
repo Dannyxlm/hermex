@@ -15,7 +15,10 @@ struct AgentRunLiveActivityWidget: Widget {
             AgentRunLockScreenView(context: context)
                 .activityBackgroundTint(AgentRunLiveActivityTheme.background)
                 .activitySystemActionForegroundColor(AgentRunLiveActivityTheme.primaryText)
-                .widgetURL(HermesDeepLink.sessionURL(sessionID: context.state.sessionID))
+                .widgetURL(HermesDeepLink.sessionURL(
+                    sessionID: context.state.sessionID,
+                    streamID: context.attributes.streamID
+                ))
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
@@ -42,7 +45,10 @@ struct AgentRunLiveActivityWidget: Widget {
             } minimal: {
                 AgentRunIslandCompactMark(status: context.state.status)
             }
-            .widgetURL(HermesDeepLink.sessionURL(sessionID: context.state.sessionID))
+            .widgetURL(HermesDeepLink.sessionURL(
+                sessionID: context.state.sessionID,
+                streamID: context.attributes.streamID
+            ))
             .keylineTint(AgentRunStatusStyle.color(for: context.state.status, isStale: context.state.isStale))
         }
     }

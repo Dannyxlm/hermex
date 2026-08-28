@@ -16,6 +16,7 @@ enum SessionNavigationDestination: Hashable, Identifiable {
 struct SessionNavigationState: Equatable {
     private(set) var destination: SessionNavigationDestination?
     private(set) var lastSelectedSessionID: String?
+    private(set) var selectedStreamID: String?
     private(set) var rootRevision = 0
     private var newChatSessionID: String?
     private var deepLinkedSessionLoadID: String?
@@ -34,8 +35,15 @@ struct SessionNavigationState: Equatable {
     }
 
     mutating func select(_ session: SessionSummary) {
+        select(session, streamID: nil)
+    }
+
+    mutating func select(_ session: SessionSummary, streamID: String?) {
         rootRevision += 1
         newChatSessionID = nil
+        // Only an explicit external target is exact. The sidebar's active stream
+        // remains advisory on SessionSummary and is primed separately by ChatView.
+        selectedStreamID = Self.normalized(streamID)
         destination = .session(session)
         remember(session)
     }
@@ -43,12 +51,14 @@ struct SessionNavigationState: Equatable {
     mutating func select(_ route: PendingNewChatRoute) {
         rootRevision += 1
         newChatSessionID = nil
+        selectedStreamID = nil
         destination = .newChat(route)
     }
 
     mutating func select(_ utility: SessionListUtilityDestination) {
         rootRevision += 1
         newChatSessionID = nil
+        selectedStreamID = nil
         destination = .utility(utility)
     }
 
@@ -63,6 +73,7 @@ struct SessionNavigationState: Equatable {
     mutating func clearDestination() {
         destination = nil
         newChatSessionID = nil
+        selectedStreamID = nil
     }
 
     mutating func beginDeepLinkedSessionLoad(id: String?) -> String? {
@@ -104,6 +115,7 @@ struct SessionNavigationState: Equatable {
             return
         }
 
+        selectedStreamID = nil
         destination = .session(session)
     }
 
@@ -115,6 +127,7 @@ struct SessionNavigationState: Equatable {
         if selectedSessionID == sessionID {
             destination = nil
             newChatSessionID = nil
+            selectedStreamID = nil
         }
 
         if lastSelectedSessionID == sessionID {

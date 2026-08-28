@@ -86,6 +86,7 @@ final class GitWorkspaceAvailabilityViewModel {
     private(set) var actionErrorMessage: String?
     private(set) var lastActionMessage: String?
     private var hasLoaded = false
+    private var hasLoadedDetails = false
 
     init(session: SessionSummary, server: URL, apiClient: APIClient? = nil) {
         self.session = session
@@ -113,37 +114,56 @@ final class GitWorkspaceAvailabilityViewModel {
             gitInfo = response.git
             hasRepository = response.git?.isGit == true
             lastError = nil
+            hasLoaded = true
 
-            if hasRepository {
-                isStatusLoading = true
-                do {
-                    status = try await apiClient.gitStatus(sessionID: sessionID).git
-                    statusError = nil
-                    hasLoaded = true
-                } catch {
-                    status = nil
-                    statusError = error
-                }
-                isStatusLoading = false
-                if statusError == nil {
-                    await loadBranches()
-                }
-            } else {
+            if !hasRepository {
                 status = nil
                 statusError = nil
                 branches = nil
                 branchesError = nil
-                hasLoaded = true
+                hasLoadedDetails = false
             }
         } catch {
             hasRepository = false
             gitInfo = nil
             status = nil
             statusError = nil
+            branches = nil
+            branchesError = nil
+            hasLoaded = false
+            hasLoadedDetails = false
             lastError = error
         }
 
         isLoading = false
+    }
+
+    /// Hydrates the expensive Git menu state only after the user asks for Git detail.
+    /// Initial chat appearance calls `load()` and stops at the lightweight repo/branch probe.
+    @MainActor
+    func loadDetailsIfNeeded() async {
+        guard hasRepository, !hasLoadedDetails, !isStatusLoading else { return }
+        await loadDetails()
+    }
+
+    @MainActor
+    private func loadDetails() async {
+        guard let sessionID = session.sessionId, hasRepository, !isStatusLoading else { return }
+        isStatusLoading = true
+        statusError = nil
+
+        do {
+            status = try await apiClient.gitStatus(sessionID: sessionID).git
+        } catch {
+            status = nil
+            statusError = error
+            isStatusLoading = false
+            return
+        }
+
+        await loadBranches()
+        hasLoadedDetails = branches != nil && branchesError == nil && !isLoadingBranches
+        isStatusLoading = false
     }
 
     var currentBranchName: String {
@@ -172,6 +192,10 @@ final class GitWorkspaceAvailabilityViewModel {
         do {
             branches = try await apiClient.gitBranches(sessionID: sessionID).branches
         } catch {
+            // A failed refresh must not leave an older branch list actionable. Keep the
+            // error so the UI can explain the failure, and leave details incomplete so
+            // the next Git open retries this request.
+            branches = nil
             branchesError = error
         }
         isLoadingBranches = false
@@ -324,11 +348,22 @@ final class GitWorkspaceAvailabilityViewModel {
     func refreshAfterExternalMutation() async {
         await refreshGitInfo()
         guard let sessionID = session.sessionId, hasRepository else { return }
-        if let refreshed = try? await apiClient.gitStatus(sessionID: sessionID).git {
-            status = refreshed
+        do {
+            status = try await apiClient.gitStatus(sessionID: sessionID).git
             statusError = nil
+        } catch {
+            // The working tree changed outside this view model, so the old status is
+            // no longer safe for staging/commit actions. Invalidate all actionable
+            // detail and let the next Git open retry the normal detail pipeline.
+            status = nil
+            statusError = error
+            branches = nil
+            branchesError = nil
+            hasLoadedDetails = false
+            return
         }
         await loadBranches()
+        hasLoadedDetails = status != nil && branches != nil && branchesError == nil && !isLoadingBranches
     }
 
     func clearActionError() {
@@ -466,15 +501,17 @@ struct GitToolbarPresentation: Equatable {
 
     var statusDot: GitToolbarStatusDot? {
         guard hasRepository else { return nil }
-        if (info?.dirty ?? 0) > 0 || (info?.behind ?? 0) > 0 { return .gray }
+        let dirty = (status?.changedCount ?? info?.dirty ?? 0) > 0
+        let behind = (status?.behind ?? info?.behind ?? 0) > 0
+        if dirty || behind { return .gray }
         return nil
     }
 
     var accessibilityValue: String {
         guard hasRepository else { return String(localized: "Repository status unavailable") }
-        let dirty = (info?.dirty ?? 0) > 0
-        let ahead = (info?.ahead ?? 0) > 0
-        let behind = (info?.behind ?? 0) > 0
+        let dirty = (status?.changedCount ?? info?.dirty ?? 0) > 0
+        let ahead = (status?.ahead ?? info?.ahead ?? 0) > 0
+        let behind = (status?.behind ?? info?.behind ?? 0) > 0
         if dirty && behind { return String(localized: "Local changes exist and remote branch moved ahead") }
         if dirty { return String(localized: "Local repository has uncommitted changes") }
         if ahead && behind { return String(localized: "Local and remote branches diverged") }

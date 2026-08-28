@@ -278,6 +278,7 @@ struct ChatView: View {
     let server: URL
     let onAPIError: (Error) -> Void
     let loadsInitialMessages: Bool
+    private let initialStreamID: String?
     /// When true, the composer auto-starts voice dictation on appear — set by the
     /// "New Chat with Voice" App Intent (#338). Defaults to false for normal opens.
     let autoStartsVoiceInput: Bool
@@ -340,6 +341,8 @@ struct ChatView: View {
     @State private var restoredDraftSettings: ChatDraftSettings?
     @State private var didApplyRestoredDraftSettings = false
     @State private var didCompleteInitialAppearance = false
+    @State private var didCompleteInitialStartup = false
+    @State private var didPrimeInitialStream = false
     @State private var isInitialComposerFocusContentReady = false
     @State private var didApplyInitialComposerFocusPolicy = false
     @State private var shouldRestoreComposerFocusAfterPreview = false
@@ -357,6 +360,7 @@ struct ChatView: View {
         initialAttachments: [SharedAttachmentImport] = [],
         loadsInitialMessages: Bool = true,
         autoStartsVoiceInput: Bool = false,
+        initialStreamID: String? = nil,
         draftStore: ChatDraftStore? = nil,
         draftAttachmentStore: (any ChatDraftAttachmentStoring)? = nil,
         restoresDraftSettings: Bool = false,
@@ -366,6 +370,7 @@ struct ChatView: View {
         self.server = server
         self.onAPIError = onAPIError
         self.loadsInitialMessages = loadsInitialMessages
+        self.initialStreamID = initialStreamID
         self.autoStartsVoiceInput = autoStartsVoiceInput
         self.draftStore = draftStore ?? .shared
         let resolvedDraftAttachmentStore = draftAttachmentStore ?? ChatDraftAttachmentStore.shared
@@ -662,6 +667,9 @@ struct ChatView: View {
                 viewModel.cleanupPollingTasks()
             }
             .onAppear {
+                guard ChatInitialAppearancePolicy.shouldReconnectOnAppear(
+                    hasCompletedInitialStartup: didCompleteInitialStartup
+                ) else { return }
                 Task {
                     await viewModel.reconnectStreamIfNeeded(modelContext: modelContext)
 
@@ -900,6 +908,7 @@ struct ChatView: View {
             isRunningAction: gitAvailabilityViewModel.isRunningGitAction,
             onTap: {
                 HapticButtonHaptics.tap(isEnabled: isHapticsEnabled)
+                Task { await gitAvailabilityViewModel.loadDetailsIfNeeded() }
             },
             onChanges: {
                 activeGitSheet = .changes
@@ -1358,14 +1367,33 @@ struct ChatView: View {
 
     private func prepareInitialAppearance() {
         viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
+        if !didPrimeInitialStream, let initialStreamID {
+            didPrimeInitialStream = true
+            viewModel.prepareForExternalStreamActivation(streamID: initialStreamID)
+        } else if !didPrimeInitialStream, let advisoryStreamID = session.activeStreamId {
+            didPrimeInitialStream = true
+            viewModel.prepareForAdvisoryStreamActivation(streamID: advisoryStreamID)
+        }
         if loadsInitialMessages {
             viewModel.prepareInitialMessageLoad(modelContext: modelContext)
         }
     }
 
     private func handleInitialAppearanceTask() async {
-        await hydrateDraftIfNeeded()
-        prepareInitialAppearance()
+        guard ChatInitialAppearancePolicy.shouldRunInitialTask(
+            hasCompletedInitialStartup: didCompleteInitialStartup
+        ) else {
+            return
+        }
+
+        await ChatInitialAppearancePolicy.prepareCacheBeforeDraftHydration(
+            prepareCache: {
+                prepareInitialAppearance()
+            },
+            hydrateDraft: {
+                await hydrateDraftIfNeeded()
+            }
+        )
 
         guard ChatInitialAppearancePolicy.shouldBeginAsyncWork(
             hasCompletedAppearance: didCompleteInitialAppearance
@@ -1377,6 +1405,8 @@ struct ChatView: View {
         async let gitAvailability: Void = loadInitialGitAvailability()
         async let draftAttachments: Void = restoreDraftAttachmentsIfNeeded()
         _ = await (chatStartup, gitAvailability, draftAttachments)
+        guard !Task.isCancelled else { return }
+        didCompleteInitialStartup = true
     }
 
     private func performInitialAsyncWork() async {
