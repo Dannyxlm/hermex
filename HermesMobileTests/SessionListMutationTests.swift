@@ -1779,6 +1779,11 @@ final class SessionListMutationTests: XCTestCase {
                 XCTAssertEqual(body["session_id"] as? String, "session-abc")
                 XCTAssertEqual(body["archived"] as? Bool, true)
                 return apiTestJSONResponse(#"{"ok": true}"#, for: request)
+            case "/api/sessions/search":
+                return apiTestJSONResponse(
+                    #"{"sessions":[{"session_id":"session-abc","title":"Older match","match_type":"content"}]}"#,
+                    for: request
+                )
             default:
                 XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
                 throw URLError(.badURL)
@@ -1786,6 +1791,8 @@ final class SessionListMutationTests: XCTestCase {
         }
 
         await viewModel.load()
+        await viewModel.searchSessions(query: "needle", debounceNanoseconds: 0)
+        XCTAssertEqual(viewModel.remoteSearchSessionIDs, ["session-abc"])
         let before = viewModel.sessions
         let didArchive = await viewModel.archive(try XCTUnwrap(viewModel.sessions.first))
 
@@ -1794,6 +1801,10 @@ final class SessionListMutationTests: XCTestCase {
         XCTAssertEqual(viewModel.sessions, before)
         XCTAssertNotNil(viewModel.lastError)
         XCTAssertNotNil(viewModel.sessionLoadError)
+        XCTAssertTrue(viewModel.remoteSearchSessionIDs.isEmpty)
+
+        await viewModel.searchSessions(query: "needle", debounceNanoseconds: 0)
+        XCTAssertTrue(viewModel.remoteSearchSessionIDs.isEmpty)
     }
 
     @MainActor

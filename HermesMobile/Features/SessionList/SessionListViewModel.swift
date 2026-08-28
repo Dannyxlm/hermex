@@ -548,14 +548,16 @@ final class SessionListViewModel {
         guard beginSessionMutation(sessionId) else { return false }
         defer { endSessionMutation(sessionId) }
 
-        let didArchive = await mutate(modelContext: modelContext, animation: animation) {
+        return await mutate(
+            modelContext: modelContext,
+            animation: animation,
+            onOperationSuccess: {
+                knownArchivedSessionIDs.insert(sessionId)
+                removeRemoteSearchSession(id: sessionId)
+            }
+        ) {
             try await sessionMutator.archive(sessionID: sessionId)
         }
-        if didArchive {
-            knownArchivedSessionIDs.insert(sessionId)
-            removeRemoteSearchSession(id: sessionId)
-        }
-        return didArchive
     }
 
     func delete(
@@ -571,13 +573,15 @@ final class SessionListViewModel {
         guard beginSessionMutation(sessionId) else { return false }
         defer { endSessionMutation(sessionId) }
 
-        let didDelete = await mutate(modelContext: modelContext, animation: animation) {
+        return await mutate(
+            modelContext: modelContext,
+            animation: animation,
+            onOperationSuccess: {
+                removeRemoteSearchSession(id: sessionId)
+            }
+        ) {
             try await sessionMutator.delete(sessionID: sessionId)
         }
-        if didDelete {
-            removeRemoteSearchSession(id: sessionId)
-        }
-        return didDelete
     }
 
     func isMutating(_ session: SessionSummary) -> Bool {
@@ -1159,6 +1163,7 @@ final class SessionListViewModel {
     private func mutate(
         modelContext: ModelContext? = nil,
         animation: Animation? = nil,
+        onOperationSuccess: () -> Void = {},
         _ operation: () async throws -> Void
     ) async -> Bool {
         actionErrorMessage = nil
@@ -1166,6 +1171,7 @@ final class SessionListViewModel {
 
         do {
             try await operation()
+            onOperationSuccess()
             return await load(modelContext: modelContext, animation: animation)
         } catch {
             guard !isCancellationError(error) else { return false }
