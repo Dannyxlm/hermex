@@ -47,6 +47,7 @@ protocol ChatStreamCoordinatorDelegate: AnyObject {
     func streamCoordinatorSaveSnapshotIfNeeded()
     @discardableResult
     func streamCoordinatorRestoreSnapshotIfAvailable(streamID: String) -> String?
+    func streamCoordinatorPrepareForFullReplay()
     func streamCoordinatorRemoveSnapshot(streamID: String?)
     func streamCoordinatorFlushPinnedLocalNoticesToTranscript()
     func streamCoordinatorDrainQueuedSlashMessageIfIdle()
@@ -81,6 +82,8 @@ protocol ChatStreamCoordinatorDelegate: AnyObject {
 @MainActor
 @Observable
 final class ChatStreamCoordinator {
+    private static let maximumReplacementHandoffCount = 8
+
     @ObservationIgnored private weak var delegate: (any ChatStreamCoordinatorDelegate)?
     private let client: APIClient
     private let streamClient: SSEStreamingClient
@@ -98,6 +101,14 @@ final class ChatStreamCoordinator {
     private(set) var liveTokensPerSecond: Double?
     private var lastRecoveryStatusCheckDate: Date?
     private(set) var isReplayConnection = false
+    /// A stream named by an external activation (for example, a Live Activity)
+    /// remains authoritative until its own status endpoint validates it. Generic
+    /// session detail can lag and must not replace this target before that check.
+    private var exactExternalActivationStreamID: String?
+    /// A lossy durable projection must replay from journal sequence zero, but the
+    /// cached turn should stay painted while transport/status setup is in flight.
+    /// Clear it only when canonical replay content actually starts arriving.
+    private var pendingFullReplayProjectionResetStreamID: String?
     // Bumped whenever the active run starts or finalizes. Captured before an async
     // transcript load so a concurrent cancel/completion during the load can't be
     // double-finalized (PR #266 review #2).
@@ -121,6 +132,11 @@ final class ChatStreamCoordinator {
         self.delegate = delegate
     }
 
+    var shouldPreserveExactExternalActivationProjection: Bool {
+        guard let exactExternalActivationStreamID else { return false }
+        return activeStreamID == exactExternalActivationStreamID && isConnectionSuspended
+    }
+
     func setShowsLiveActivityResponseExcerpts(_ shows: Bool) {
         guard showsLiveActivityResponseExcerpts != shows else { return }
 
@@ -131,9 +147,47 @@ final class ChatStreamCoordinator {
     }
 
     func prepareForNewResponse() {
+        exactExternalActivationStreamID = nil
+        pendingFullReplayProjectionResetStreamID = nil
         hasCompletedCurrentResponse = false
         isConnectionSuspended = false
         liveTokensPerSecond = nil
+    }
+
+    /// Primes a newly opened chat from an external activation (for example, a
+    /// Live Activity tap) before any session-detail request completes. The run is
+    /// deliberately marked suspended: cached snapshot state can paint now, while
+    /// `reconnectIfNeeded` remains the single authority for status/replay catch-up.
+    func prepareForExternalActivation(streamID rawStreamID: String) {
+        prepareForActivation(streamID: rawStreamID, isExactExternalTarget: true)
+    }
+
+    func prepareForAdvisoryActivation(streamID rawStreamID: String) {
+        prepareForActivation(streamID: rawStreamID, isExactExternalTarget: false)
+    }
+
+    private func prepareForActivation(
+        streamID rawStreamID: String,
+        isExactExternalTarget: Bool
+    ) {
+        let streamID = rawStreamID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !streamID.isEmpty else { return }
+
+        if activeStreamID != streamID {
+            runGeneration &+= 1
+            lastEventID = nil
+            pendingFullReplayProjectionResetStreamID = nil
+        }
+        exactExternalActivationStreamID = isExactExternalTarget ? streamID : nil
+        activeStreamID = streamID
+        hasCompletedCurrentResponse = false
+        isConnectionSuspended = true
+        liveTokensPerSecond = nil
+        delegate?.streamCoordinatorStreamingAssistantMessageID = nil
+        restoreSnapshotIfAvailable(streamID: streamID)
+        if delegate?.streamCoordinatorStreamingAssistantMessageID == nil {
+            delegate?.streamCoordinatorStreamingAssistantMessageID = delegate?.streamCoordinatorLatestAssistantMessageID()
+        }
     }
 
     func start(
@@ -141,6 +195,7 @@ final class ChatStreamCoordinator {
         replayAfterSeq: Int? = nil,
         recoveryState: ActiveStreamRecoveryState = .idle
     ) {
+        exactExternalActivationStreamID = nil
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
         runGeneration &+= 1
@@ -148,6 +203,7 @@ final class ChatStreamCoordinator {
         isConnectionSuspended = false
         if replayAfterSeq == nil {
             lastEventID = nil
+            pendingFullReplayProjectionResetStreamID = nil
         }
 
         markConnectionStarted(
@@ -210,6 +266,16 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
 
+        if let exactExternalActivationStreamID {
+            adoptLoadedActiveStream(exactExternalActivationStreamID)
+            isConnectionSuspended = true
+            restoreSnapshotIfAvailable(streamID: exactExternalActivationStreamID)
+            if delegate?.streamCoordinatorStreamingAssistantMessageID == nil {
+                delegate?.streamCoordinatorStreamingAssistantMessageID = delegate?.streamCoordinatorLatestAssistantMessageID()
+            }
+            return
+        }
+
         if usedCacheFallback {
             activeStreamID = nil
             isConnectionSuspended = false
@@ -222,7 +288,7 @@ final class ChatStreamCoordinator {
         if preparation.shouldPrepareSuspendedStreamResume {
             delegate?.streamCoordinatorStreamingAssistantMessageID = nil
             if let streamID = loadedActiveStreamID, !streamID.isEmpty {
-                activeStreamID = streamID
+                adoptLoadedActiveStream(streamID)
                 delegate?.streamCoordinatorStreamingAssistantMessageID = delegate?.streamCoordinatorLatestAssistantMessageID()
                 isConnectionSuspended = true
                 restoreSnapshotIfAvailable(streamID: streamID)
@@ -236,7 +302,7 @@ final class ChatStreamCoordinator {
                 ? loadedActiveStreamID
                 : preparation.activeStreamIDBeforeLoad
             if let streamID {
-                activeStreamID = streamID
+                adoptLoadedActiveStream(streamID)
                 delegate?.streamCoordinatorStreamingAssistantMessageID = delegate?.streamCoordinatorLatestAssistantMessageID()
                 restoreSnapshotIfAvailable(streamID: streamID)
                 if delegate?.streamCoordinatorStreamingAssistantMessageID == nil {
@@ -248,6 +314,13 @@ final class ChatStreamCoordinator {
     }
 
     func reconnectIfNeeded(modelContext: ModelContext? = nil) async {
+        await reconnectIfNeeded(modelContext: modelContext, replacementHandoffDepth: 0)
+    }
+
+    private func reconnectIfNeeded(
+        modelContext: ModelContext?,
+        replacementHandoffDepth: Int
+    ) async {
         guard let activeStreamID, isConnectionSuspended else { return }
         let generation = runGeneration
 
@@ -266,15 +339,39 @@ final class ChatStreamCoordinator {
                 if delegate?.streamCoordinatorStreamingAssistantMessageID == nil {
                     delegate?.streamCoordinatorStreamingAssistantMessageID = delegate?.streamCoordinatorLatestAssistantMessageID()
                 }
+                let replayAfterSeq = prepareReplayFromRestoredSnapshotIfNeeded(
+                    streamID: streamIDToResume,
+                    fallbackToZero: false
+                )
                 isConnectionSuspended = false
-                start(streamID: streamIDToResume)
+                start(streamID: streamIDToResume, replayAfterSeq: replayAfterSeq)
             } else if response.replayAvailable == true {
-                let replayAfterSeq = Self.runJournalReplayAfterSeq(from: lastEventID) ?? 0
+                let replayAfterSeq = prepareReplayFromRestoredSnapshotIfNeeded(
+                    streamID: activeStreamID,
+                    fallbackToZero: true
+                ) ?? 0
                 self.activeStreamID = activeStreamID
                 isConnectionSuspended = false
                 start(streamID: activeStreamID, replayAfterSeq: replayAfterSeq)
             } else {
+                if exactExternalActivationStreamID == activeStreamID {
+                    // Status is authoritative for the exact Live Activity stream.
+                    // Release the temporary pin before refreshing session detail so
+                    // a newer active stream can take ownership of the chat.
+                    exactExternalActivationStreamID = nil
+                }
                 await delegate?.streamCoordinatorLoadMessages(modelContext: modelContext)
+                if let replacementStreamID = self.activeStreamID,
+                   replacementStreamID != activeStreamID,
+                   isConnectionSuspended {
+                    if replacementHandoffDepth < Self.maximumReplacementHandoffCount {
+                        await reconnectIfNeeded(
+                            modelContext: modelContext,
+                            replacementHandoffDepth: replacementHandoffDepth + 1
+                        )
+                    }
+                    return
+                }
                 // Bail if a concurrent completion/cancel/new run finalized or
                 // replaced this run during the load (see canFinalizeRunAfterLoad).
                 guard canFinalizeRunAfterLoad(streamID: activeStreamID, capturedGeneration: generation) else { return }
@@ -288,7 +385,21 @@ final class ChatStreamCoordinator {
             if (error as? APIError)?.indicatesMissingStream == true,
                self.activeStreamID == activeStreamID,
                isConnectionSuspended {
+                if exactExternalActivationStreamID == activeStreamID {
+                    exactExternalActivationStreamID = nil
+                }
                 await delegate?.streamCoordinatorLoadMessages(modelContext: modelContext)
+                if let replacementStreamID = self.activeStreamID,
+                   replacementStreamID != activeStreamID,
+                   isConnectionSuspended {
+                    if replacementHandoffDepth < Self.maximumReplacementHandoffCount {
+                        await reconnectIfNeeded(
+                            modelContext: modelContext,
+                            replacementHandoffDepth: replacementHandoffDepth + 1
+                        )
+                    }
+                    return
+                }
                 guard canFinalizeRunAfterLoad(streamID: activeStreamID, capturedGeneration: generation) else { return }
                 finalizeInactiveStream(streamID: activeStreamID)
                 return
@@ -411,6 +522,14 @@ final class ChatStreamCoordinator {
         isReplayConnection = false
     }
 
+    /// Durable snapshot hydration is asynchronous so disk work never blocks the UI.
+    /// Preserve any newer in-memory cursor that arrived while the read was in flight.
+    func adoptRestoredSnapshotEventIDIfNeeded(_ eventID: String?) {
+        guard let eventID else { return }
+        guard lastEventID == nil || Self.requiresFullReplay(from: eventID) else { return }
+        lastEventID = eventID
+    }
+
     nonisolated static func runJournalReplayAfterSeq(from eventID: String?) -> Int? {
         guard let eventID = eventID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !eventID.isEmpty
@@ -432,9 +551,36 @@ final class ChatStreamCoordinator {
         return max(0, sequence)
     }
 
+    nonisolated static func fullReplayEventID(streamID: String) -> String {
+        "hermes-full-replay:\(streamID):0"
+    }
+
+    nonisolated static func requiresFullReplay(from eventID: String?) -> Bool {
+        eventID?.hasPrefix("hermes-full-replay:") == true
+    }
+
+    private func prepareReplayFromRestoredSnapshotIfNeeded(
+        streamID: String,
+        fallbackToZero: Bool
+    ) -> Int? {
+        guard Self.requiresFullReplay(from: lastEventID) else {
+            return Self.runJournalReplayAfterSeq(from: lastEventID) ?? (fallbackToZero ? 0 : nil)
+        }
+
+        // A durable snapshot is deliberately bounded. If it omitted any current-run
+        // output, retaining its later event cursor could permanently skip that output.
+        // Arm a deferred reset of the cached current-run projection, then rebuild it
+        // canonically from journal sequence zero. Deferring until the first replay
+        // content event keeps the cached turn visible while catch-up connects.
+        pendingFullReplayProjectionResetStreamID = streamID
+        lastEventID = "\(streamID):0"
+        return 0
+    }
+
     private func handle(_ event: SSEEvent) {
         lastEventID = streamClient.lastEventID ?? lastEventID
         lastTransportActivityDate = Date()
+        resetLossyProjectionWhenCanonicalReplayBegins(event)
 
         switch event {
         case .token(let text):
@@ -519,6 +665,28 @@ final class ChatStreamCoordinator {
         case .ignored:
             break
         }
+    }
+
+    private func resetLossyProjectionWhenCanonicalReplayBegins(_ event: SSEEvent) {
+        guard pendingFullReplayProjectionResetStreamID == activeStreamID else { return }
+
+        let contributesCanonicalReplayContent: Bool
+        switch event {
+        case .token(let text), .reasoning(let text):
+            contributesCanonicalReplayContent = !text.isEmpty
+        case .interimAssistant(let payload):
+            contributesCanonicalReplayContent = payload.alreadyStreamed != true && payload.text?.isEmpty == false
+        case .toolStarted, .toolCompleted:
+            contributesCanonicalReplayContent = true
+        case .done(let payload):
+            contributesCanonicalReplayContent = payload.session?.messages?.isEmpty == false
+        default:
+            contributesCanonicalReplayContent = false
+        }
+
+        guard contributesCanonicalReplayContent else { return }
+        pendingFullReplayProjectionResetStreamID = nil
+        delegate?.streamCoordinatorPrepareForFullReplay()
     }
 
     private func handleTransportError(_ message: String) {
@@ -631,6 +799,8 @@ final class ChatStreamCoordinator {
     }
 
     private func completeCurrentResponse(needsTranscriptRefresh: Bool) {
+        exactExternalActivationStreamID = nil
+        pendingFullReplayProjectionResetStreamID = nil
         runGeneration &+= 1
         liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
         delegate?.streamCoordinatorRemoveSnapshot(streamID: activeStreamID)
@@ -682,6 +852,8 @@ final class ChatStreamCoordinator {
     }
 
     private func finishStream() {
+        exactExternalActivationStreamID = nil
+        pendingFullReplayProjectionResetStreamID = nil
         runGeneration &+= 1
         let completedNormally = hasCompletedCurrentResponse
         let finishedStreamID = activeStreamID
@@ -735,12 +907,22 @@ final class ChatStreamCoordinator {
         )
     }
 
-    private func restoreSnapshotIfAvailable(streamID: String) {
-        guard lastEventID == nil else {
-            _ = delegate?.streamCoordinatorRestoreSnapshotIfAvailable(streamID: streamID)
-            return
+    /// Session detail may hand an inactive target off to a different active stream.
+    /// Replay cursors are stream-scoped: changing identity must discard the prior
+    /// stream's cursor before restoring the replacement's own snapshot.
+    private func adoptLoadedActiveStream(_ streamID: String) {
+        if activeStreamID != streamID {
+            runGeneration &+= 1
+            lastEventID = nil
+            pendingFullReplayProjectionResetStreamID = nil
         }
+        activeStreamID = streamID
+    }
 
-        lastEventID = delegate?.streamCoordinatorRestoreSnapshotIfAvailable(streamID: streamID) ?? lastEventID
+    private func restoreSnapshotIfAvailable(streamID: String) {
+        guard let restoredEventID = delegate?.streamCoordinatorRestoreSnapshotIfAvailable(streamID: streamID)
+        else { return }
+        guard lastEventID == nil || Self.requiresFullReplay(from: restoredEventID) else { return }
+        lastEventID = restoredEventID
     }
 }

@@ -14,7 +14,7 @@ struct SessionListView: View {
     private let didRoutePendingSharedImport: (SharedImportReservation) -> Void
     private let hasWaitingSharedImport: Bool
     private let openNextSharedImport: () -> Void
-    @Binding private var pendingDeepLinkedSessionID: String?
+    @Binding private var pendingDeepLinkedSessionTarget: SessionDeepLinkTarget?
     @Binding private var requestedNewChat: NewChatRequest?
 
     @Environment(\.modelContext) private var modelContext
@@ -78,7 +78,7 @@ struct SessionListView: View {
         didRoutePendingSharedImport: @escaping (SharedImportReservation) -> Void = { _ in },
         hasWaitingSharedImport: Bool = false,
         openNextSharedImport: @escaping () -> Void = {},
-        pendingDeepLinkedSessionID: Binding<String?> = .constant(nil),
+        pendingDeepLinkedSessionTarget: Binding<SessionDeepLinkTarget?> = .constant(nil),
         requestedNewChat: Binding<NewChatRequest?> = .constant(nil),
         draftStore: ChatDraftStore? = nil
     ) {
@@ -89,7 +89,7 @@ struct SessionListView: View {
         self.hasWaitingSharedImport = hasWaitingSharedImport
         self.openNextSharedImport = openNextSharedImport
         self.draftStore = draftStore ?? .shared
-        _pendingDeepLinkedSessionID = pendingDeepLinkedSessionID
+        _pendingDeepLinkedSessionTarget = pendingDeepLinkedSessionTarget
         _requestedNewChat = requestedNewChat
         _viewModel = State(initialValue: SessionListViewModel(server: server))
         _navigationState = State(
@@ -252,7 +252,7 @@ struct SessionListView: View {
             .onChange(of: pendingSharedImport) {
                 openPendingSharedImportIfNeeded()
             }
-            .onChange(of: pendingDeepLinkedSessionID) {
+            .onChange(of: pendingDeepLinkedSessionTarget) {
                 Task { await openPendingDeepLinkedSessionIfNeeded() }
             }
             .onChange(of: requestedNewChat) {
@@ -383,9 +383,10 @@ struct SessionListView: View {
                 session: session,
                 server: server,
                 onAPIError: authManager.handleAPIError,
+                initialStreamID: navigationState.selectedStreamID,
                 draftStore: draftStore
             )
-                .id(session.id)
+                .id(navigationState.rootRevision)
         case .newChat(let route):
             PendingNewChatView(
                 initialDraft: route.initialDraft,
@@ -1236,19 +1237,22 @@ struct SessionListView: View {
     private func openPendingDeepLinkedSessionIfNeeded() async {
         guard !Task.isCancelled else { return }
 
-        while let sessionID = navigationState.beginDeepLinkedSessionLoad(
-            id: pendingDeepLinkedSessionID
-        ) {
-            pendingDeepLinkedSessionID = nil
-            await openDeepLinkedSession(id: sessionID)
+        while let target = pendingDeepLinkedSessionTarget {
+            guard let sessionID = navigationState.beginDeepLinkedSessionLoad(
+                id: target.sessionID
+            ) else { return }
+
+            pendingDeepLinkedSessionTarget = nil
+            await openDeepLinkedSession(target: target)
             navigationState.finishDeepLinkedSessionLoad(id: sessionID)
             guard !Task.isCancelled else { return }
         }
     }
 
-    private func openDeepLinkedSession(id sessionID: String) async {
+    private func openDeepLinkedSession(target: SessionDeepLinkTarget) async {
+        let sessionID = target.sessionID
         if let loadedSession = viewModel.sessions.first(where: { $0.sessionId == sessionID }) {
-            selectSession(loadedSession)
+            selectSession(loadedSession, streamID: target.streamID)
             return
         }
 
@@ -1259,7 +1263,7 @@ struct SessionListView: View {
         // whose owning view no longer exists is stale work, not a real navigation.
         guard !Task.isCancelled else { return }
         if let session {
-            selectSession(session)
+            selectSession(session, streamID: target.streamID)
         }
         handleLastError()
     }
@@ -1283,9 +1287,9 @@ struct SessionListView: View {
         navigationState.select(PendingNewChatRoute())
     }
 
-    private func selectSession(_ session: SessionSummary) {
+    private func selectSession(_ session: SessionSummary, streamID: String? = nil) {
         viewModel.markSessionOpened(session)
-        navigationState.select(session)
+        navigationState.select(session, streamID: streamID)
         persistLastSelectedSession()
     }
 
@@ -1303,7 +1307,7 @@ struct SessionListView: View {
         navigationState.restoreIfNeeded(
             from: viewModel.sessions,
             clearsMissingSelection: viewModel.sessionLoadError == nil,
-            pendingDeepLinkedSessionID: pendingDeepLinkedSessionID
+            pendingDeepLinkedSessionID: pendingDeepLinkedSessionTarget?.sessionID
         )
         if let selectedSessionID = navigationState.selectedSessionID,
            let selectedSession = viewModel.sessions.first(where: { $0.sessionId == selectedSessionID }) {

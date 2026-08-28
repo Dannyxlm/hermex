@@ -442,6 +442,7 @@ final class ChatViewModel {
     private var isRefreshingCompletedResponseTitle = false
     private var isActiveStreamReplayConnection: Bool { streamCoordinator.isReplayConnection }
     private var activeStreamReplayMatchedPrefixLength = 0
+    private var activeStreamReplayMatchedPrefixSeedLength: Int?
     private var activeStreamReplayMatchedInterimLength = 0
     private var activeStreamReplayMatchedReasoningLength = 0
     private var activeStreamReplayToolMatchIndex = 0
@@ -546,6 +547,41 @@ final class ChatViewModel {
         ActiveChatStreamSnapshotStore.shared.removeAll()
     }
 
+    nonisolated static func configureActiveStreamSnapshotsForTesting(directoryURL: URL?) {
+        ActiveChatStreamSnapshotStore.shared.configurePersistenceDirectoryForTesting(directoryURL)
+    }
+
+    nonisolated static func clearActiveStreamSnapshotMemoryForTesting() {
+        ActiveChatStreamSnapshotStore.shared.clearMemoryOnly()
+    }
+
+    nonisolated static func awaitActiveStreamSnapshotPersistenceForTesting() async {
+        await ActiveChatStreamSnapshotStore.shared.waitForPendingPersistenceForTesting()
+    }
+
+    nonisolated static func activeStreamSnapshotPersistenceRanOnMainThreadForTesting() -> Bool? {
+        ActiveChatStreamSnapshotStore.shared.persistenceRanOnMainThreadForTesting()
+    }
+
+    /// Durable hydration is allowed to mutate visible chat state only while the
+    /// stream requested before the await is still the active stream afterwards.
+    nonisolated static func shouldApplyDurableActiveStreamSnapshot(
+        requestedStreamID: String,
+        currentActiveStreamID: String?
+    ) -> Bool {
+        currentActiveStreamID == requestedStreamID
+    }
+
+    /// A cold durable read can complete after a newer live save. Cache state is
+    /// monotonic by save time; equal timestamps preserve the already-visible record.
+    nonisolated static func shouldCacheRestoredActiveStreamSnapshot(
+        existingSavedAt: TimeInterval?,
+        restoredSavedAt: TimeInterval
+    ) -> Bool {
+        guard let existingSavedAt else { return true }
+        return restoredSavedAt > existingSavedAt
+    }
+
     // Test seam: deterministically await the in-flight coalesced scroll-trigger task
     // so streaming assertions never depend on the real coalescing window elapsing.
     // No-op when no trigger is pending.
@@ -557,6 +593,8 @@ final class ChatViewModel {
         let messages: [ChatMessage]
         let streamingAssistantMessageID: String?
         let usedSnapshotMessagesOffset: Bool
+        let replayMatchedPrefixLength: Int?
+        let requiresFullReplay: Bool
     }
 
     var selectedModelID: String? {
@@ -1394,26 +1432,49 @@ final class ChatViewModel {
                         limit: Self.messagePageLimit
                     )
                     if !cachedMessages.isEmpty {
-                        clearCompressionAnchorMetadata()
-                        messages = cachedMessages
-                        latestServerLoadHadAssistantResponseAfterLatestUser = Self.hasAssistantResponseAfterLatestUser(
-                            in: messages
-                        )
-                        responseCompletionNeedsTranscriptRefresh = false
-                        messagesOffset = 0
-                        hasOlderMessages = false
-                        isViewingCachedData = true
-                        contextWindowSnapshot = nil
-                        errorMessage = nil
-                        setCompletedToolCallGroups([])
-                        completedReasoningGroups = []
-                        liveToolCalls = []
-                        liveReasoningText = ""
-                        pinnedLocalNotices = []
-                        toolCallAnchorMessageID = nil
-                        reasoningAnchorMessageID = nil
-                        streamingAssistantMessageID = nil
-                        attachmentCoordinator.removeAllLocalPreviews()
+                        let preservesExactLiveProjection =
+                            streamCoordinator.shouldPreserveExactExternalActivationProjection &&
+                            (!messages.isEmpty ||
+                             streamingAssistantMessageID != nil ||
+                             !liveReasoningText.isEmpty ||
+                             !liveToolCalls.isEmpty ||
+                             !completedReasoningGroups.isEmpty ||
+                             !completedToolCallGroups.isEmpty ||
+                             !pinnedLocalNotices.isEmpty)
+
+                        if preservesExactLiveProjection {
+                            // The Live Activity selected an exact stream and its
+                            // snapshot is newer than this general transcript cache.
+                            // Keep the visible assistant/reasoning/tool projection
+                            // intact while still marking the view as offline data.
+                            latestServerLoadHadAssistantResponseAfterLatestUser = Self.hasAssistantResponseAfterLatestUser(
+                                in: messages
+                            )
+                            responseCompletionNeedsTranscriptRefresh = false
+                            isViewingCachedData = true
+                            errorMessage = nil
+                        } else {
+                            clearCompressionAnchorMetadata()
+                            messages = cachedMessages
+                            latestServerLoadHadAssistantResponseAfterLatestUser = Self.hasAssistantResponseAfterLatestUser(
+                                in: messages
+                            )
+                            responseCompletionNeedsTranscriptRefresh = false
+                            messagesOffset = 0
+                            hasOlderMessages = false
+                            isViewingCachedData = true
+                            contextWindowSnapshot = nil
+                            errorMessage = nil
+                            setCompletedToolCallGroups([])
+                            completedReasoningGroups = []
+                            liveToolCalls = []
+                            liveReasoningText = ""
+                            pinnedLocalNotices = []
+                            toolCallAnchorMessageID = nil
+                            reasoningAnchorMessageID = nil
+                            streamingAssistantMessageID = nil
+                            attachmentCoordinator.removeAllLocalPreviews()
+                        }
                         streamCoordinator.reconcileSessionLoad(
                             loadedActiveStreamID: nil,
                             preparation: streamLoadPreparation,
@@ -1541,7 +1602,10 @@ final class ChatViewModel {
             return false
         }
 
-        resetPendingStreamingContentBuffers()
+        // Pagination must not discard or rewind replay-match state. Flush any
+        // queued visible chunks first so the counters remain aligned with the
+        // transcript while older rows are prepended.
+        flushPendingStreamingContent()
         let messageBefore = messagesOffset
         isLoadingOlderMessages = true
         errorMessage = nil
@@ -1802,7 +1866,9 @@ final class ChatViewModel {
             return ActiveStreamMessageMerge(
                 messages: loadedMessages,
                 streamingAssistantMessageID: latestAssistantMessageID(in: loadedMessages),
-                usedSnapshotMessagesOffset: false
+                usedSnapshotMessagesOffset: false,
+                replayMatchedPrefixLength: nil,
+                requiresFullReplay: false
             )
         }
 
@@ -1813,22 +1879,33 @@ final class ChatViewModel {
                 return ActiveStreamMessageMerge(
                     messages: snapshot.messages,
                     streamingAssistantMessageID: latestAssistantMessageID(in: snapshot.messages),
-                    usedSnapshotMessagesOffset: true
+                    usedSnapshotMessagesOffset: true,
+                    replayMatchedPrefixLength: nil,
+                    requiresFullReplay: false
                 )
             }
 
             return ActiveStreamMessageMerge(
                 messages: loadedMessages,
                 streamingAssistantMessageID: latestAssistantMessageID(in: loadedMessages),
-                usedSnapshotMessagesOffset: false
+                usedSnapshotMessagesOffset: false,
+                replayMatchedPrefixLength: nil,
+                requiresFullReplay: false
             )
         }
 
+        let snapshotContentLength = snapshotAssistant.content?.count ?? 0
+        let snapshotAssistantContentLength = min(
+            snapshot.assistantReplayPrefixLength ?? snapshotContentLength,
+            snapshotContentLength
+        )
         guard !loadedMessages.isEmpty else {
             return ActiveStreamMessageMerge(
                 messages: snapshot.messages,
                 streamingAssistantMessageID: snapshotAssistant.messageId,
-                usedSnapshotMessagesOffset: true
+                usedSnapshotMessagesOffset: true,
+                replayMatchedPrefixLength: snapshotAssistantContentLength,
+                requiresFullReplay: false
             )
         }
 
@@ -1843,6 +1920,12 @@ final class ChatViewModel {
 
         if let assistantIndex = assistantSearchRange.reversed().first(where: { mergedMessages[$0].role == "assistant" }) {
             let loadedAssistant = mergedMessages[assistantIndex]
+            let loadedContent = loadedAssistant.content ?? ""
+            let snapshotContent = snapshotAssistant.content ?? ""
+            let requiresFullReplay = !loadedContent.isEmpty &&
+                !snapshotContent.isEmpty &&
+                !loadedContent.hasPrefix(snapshotContent) &&
+                !snapshotContent.hasPrefix(loadedContent)
             mergedMessages[assistantIndex] = ChatMessage(
                 role: loadedAssistant.role,
                 content: reconciledActiveStreamContent(
@@ -1863,7 +1946,9 @@ final class ChatViewModel {
             return ActiveStreamMessageMerge(
                 messages: mergedMessages,
                 streamingAssistantMessageID: mergedMessages[assistantIndex].messageId,
-                usedSnapshotMessagesOffset: false
+                usedSnapshotMessagesOffset: false,
+                replayMatchedPrefixLength: requiresFullReplay ? nil : snapshotAssistantContentLength,
+                requiresFullReplay: requiresFullReplay
             )
         }
 
@@ -1874,7 +1959,9 @@ final class ChatViewModel {
         return ActiveStreamMessageMerge(
             messages: mergedMessages,
             streamingAssistantMessageID: snapshotAssistant.messageId,
-            usedSnapshotMessagesOffset: false
+            usedSnapshotMessagesOffset: false,
+            replayMatchedPrefixLength: snapshotAssistantContentLength,
+            requiresFullReplay: false
         )
     }
 
@@ -3839,11 +3926,25 @@ final class ChatViewModel {
         pendingActionCoordinator.stopMonitoring(clearPrompt: true)
     }
 
+    func prepareForExternalStreamActivation(streamID: String) {
+        streamCoordinator.prepareForExternalActivation(streamID: streamID)
+    }
+
+    func prepareForAdvisoryStreamActivation(streamID: String) {
+        streamCoordinator.prepareForAdvisoryActivation(streamID: streamID)
+    }
+
     private func suspendActiveStreamConnection() {
         streamCoordinator.suspendActiveStreamConnection()
     }
 
     func reconnectStreamIfNeeded(modelContext: ModelContext? = nil) async {
+        if let activeStreamID {
+            let restoredEventID = await restoreActiveStreamSnapshotFromDurableStorageIfAvailable(
+                streamID: activeStreamID
+            )
+            streamCoordinator.adoptRestoredSnapshotEventIDIfNeeded(restoredEventID)
+        }
         await streamCoordinator.reconnectIfNeeded(modelContext: modelContext)
     }
 
@@ -3901,6 +4002,22 @@ final class ChatViewModel {
               !hasCompletedCurrentResponse
         else { return }
 
+        // A cold external activation owns a stream identity before it has hydrated
+        // any transcript or cursor state. Persisting that empty placeholder would
+        // mask a valid durable snapshot under the same key and silently discard the
+        // replay boundary before reconnect. Only a meaningful live projection may
+        // replace an existing snapshot.
+        let hasRestorableProjection =
+            !messages.isEmpty ||
+            streamingAssistantMessageID != nil ||
+            streamCoordinator.lastEventID != nil ||
+            !completedToolCallGroups.isEmpty ||
+            !completedReasoningGroups.isEmpty ||
+            !liveToolCalls.isEmpty ||
+            !liveReasoningText.isEmpty ||
+            !pinnedLocalNotices.isEmpty
+        guard hasRestorableProjection else { return }
+
         ActiveChatStreamSnapshotStore.shared.save(
             ActiveChatStreamSnapshot(
                 messages: messages,
@@ -3911,6 +4028,7 @@ final class ChatViewModel {
                 liveToolCalls: liveToolCalls,
                 liveReasoningText: liveReasoningText,
                 activeStreamLastEventID: streamCoordinator.lastEventID,
+                assistantReplayPrefixLength: activeStreamReplayPrefixLengthForSnapshot(),
                 streamingAssistantMessageID: streamingAssistantMessageID,
                 toolCallAnchorMessageID: toolCallAnchorMessageID,
                 reasoningAnchorMessageID: reasoningAnchorMessageID,
@@ -3924,6 +4042,21 @@ final class ChatViewModel {
         )
     }
 
+    private func activeStreamReplayPrefixLengthForSnapshot() -> Int? {
+        guard let streamingAssistantMessageID,
+              let assistant = messages.first(where: { $0.messageId == streamingAssistantMessageID })
+        else { return nil }
+
+        let contentLength = assistant.content?.count ?? 0
+        if let activeStreamReplayMatchedPrefixSeedLength {
+            return min(activeStreamReplayMatchedPrefixSeedLength, contentLength)
+        }
+        if isActiveStreamReplayConnection {
+            return min(activeStreamReplayMatchedPrefixLength, contentLength)
+        }
+        return contentLength
+    }
+
     @discardableResult
     private func restoreActiveStreamSnapshotIfAvailable(streamID: String) -> String? {
         guard let sessionID,
@@ -3934,7 +4067,34 @@ final class ChatViewModel {
               )
         else { return nil }
 
+        return applyActiveStreamSnapshot(snapshot, streamID: streamID)
+    }
+
+    @discardableResult
+    private func restoreActiveStreamSnapshotFromDurableStorageIfAvailable(
+        streamID: String
+    ) async -> String? {
+        guard let sessionID,
+              let snapshot = await ActiveChatStreamSnapshotStore.shared.snapshotFromDurableStorage(
+                server: server,
+                sessionID: sessionID,
+                streamID: streamID
+              ),
+              Self.shouldApplyDurableActiveStreamSnapshot(
+                requestedStreamID: streamID,
+                currentActiveStreamID: activeStreamID
+              )
+        else { return nil }
+
+        return applyActiveStreamSnapshot(snapshot, streamID: streamID)
+    }
+
+    private func applyActiveStreamSnapshot(
+        _ snapshot: ActiveChatStreamSnapshot,
+        streamID: String
+    ) -> String? {
         let merge = Self.mergingLoadedMessages(messages, withActiveStreamSnapshot: snapshot)
+        activeStreamReplayMatchedPrefixSeedLength = merge.replayMatchedPrefixLength
         messages = merge.messages
         if merge.usedSnapshotMessagesOffset {
             messagesOffset = snapshot.messagesOffset
@@ -3960,6 +4120,9 @@ final class ChatViewModel {
         attachmentCoordinator.mergeLocalAttachmentPreviews(snapshot.localAttachmentPreviews)
         pinnedLocalNotices = snapshot.pinnedLocalNotices
         scheduleStreamingScrollTrigger()
+        if merge.requiresFullReplay {
+            return ChatStreamCoordinator.fullReplayEventID(streamID: streamID)
+        }
         return snapshot.activeStreamLastEventID
     }
 
@@ -5132,6 +5295,53 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
         restoreActiveStreamSnapshotIfAvailable(streamID: streamID)
     }
 
+    func streamCoordinatorPrepareForFullReplay() {
+        flushPendingStreamingContent()
+        activeStreamReplayMatchedPrefixSeedLength = nil
+
+        var currentTurnAnchorIDs = Set(
+            TranscriptTurnClassifier.currentTurnAssistantAnchorIDs(
+                in: messages,
+                messageOffset: messagesOffset
+            )
+        )
+        if let streamingAssistantMessageID {
+            currentTurnAnchorIDs.insert(streamingAssistantMessageID)
+        }
+        if let toolCallAnchorMessageID {
+            currentTurnAnchorIDs.insert(toolCallAnchorMessageID)
+        }
+        if let reasoningAnchorMessageID {
+            currentTurnAnchorIDs.insert(reasoningAnchorMessageID)
+        }
+
+        messages = messages.enumerated().compactMap { index, message in
+            guard message.role == "assistant" else { return message }
+            let anchorID = TranscriptTurnClassifier.anchorID(
+                for: message,
+                at: index,
+                messageOffset: messagesOffset
+            )
+            return currentTurnAnchorIDs.contains(anchorID) ? nil : message
+        }
+        setCompletedToolCallGroups(
+            completedToolCallGroups.filter { group in
+                guard let anchorMessageID = group.anchorMessageID else { return true }
+                return !currentTurnAnchorIDs.contains(anchorMessageID)
+            }
+        )
+        completedReasoningGroups.removeAll { group in
+            guard let anchorMessageID = group.anchorMessageID else { return false }
+            return currentTurnAnchorIDs.contains(anchorMessageID)
+        }
+        liveToolCalls = []
+        liveReasoningText = ""
+        streamingAssistantMessageID = nil
+        toolCallAnchorMessageID = nil
+        reasoningAnchorMessageID = nil
+        scheduleStreamingScrollTrigger()
+    }
+
     func streamCoordinatorRemoveSnapshot(streamID: String?) {
         removeActiveStreamSnapshot(streamID: streamID)
     }
@@ -5168,7 +5378,10 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     }
 
     func streamCoordinatorDidStartConnection(isReplay: Bool) {
-        activeStreamReplayMatchedPrefixLength = 0
+        activeStreamReplayMatchedPrefixLength = isReplay
+            ? activeStreamReplayMatchedPrefixSeedLength ?? 0
+            : 0
+        activeStreamReplayMatchedPrefixSeedLength = nil
         activeStreamReplayMatchedInterimLength = 0
         activeStreamReplayMatchedReasoningLength = 0
         activeStreamReplayToolMatchIndex = 0
@@ -5177,6 +5390,7 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
 
     func streamCoordinatorDidResetRecoveryState() {
         activeStreamReplayMatchedPrefixLength = 0
+        activeStreamReplayMatchedPrefixSeedLength = nil
         activeStreamReplayMatchedInterimLength = 0
         activeStreamReplayMatchedReasoningLength = 0
         activeStreamReplayToolMatchIndex = 0
@@ -5284,7 +5498,7 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     }
 }
 
-private struct ActiveChatStreamSnapshot: Equatable {
+private struct ActiveChatStreamSnapshot: Equatable, @unchecked Sendable {
     let messages: [ChatMessage]
     let messagesOffset: Int
     let displayTitle: String
@@ -5293,6 +5507,9 @@ private struct ActiveChatStreamSnapshot: Equatable {
     let liveToolCalls: [ToolCall]
     let liveReasoningText: String
     let activeStreamLastEventID: String?
+    /// Assistant-text boundary represented by `activeStreamLastEventID`. Session
+    /// detail can be newer than that cursor, so this is not always content.count.
+    let assistantReplayPrefixLength: Int?
     let streamingAssistantMessageID: String?
     let toolCallAnchorMessageID: String?
     let reasoningAnchorMessageID: String?
@@ -5301,17 +5518,255 @@ private struct ActiveChatStreamSnapshot: Equatable {
     let pinnedLocalNotices: [String]
 }
 
-private struct ActiveChatStreamSnapshotKey: Hashable {
+private struct ActiveChatStreamSnapshotKey: Codable, Hashable, Sendable {
     let server: String
     let sessionID: String
     let streamID: String
 }
 
-private final class ActiveChatStreamSnapshotStore {
+private final class ActiveChatStreamSnapshotStore: @unchecked Sendable {
     static let shared = ActiveChatStreamSnapshotStore()
 
+    private static let persistenceVersion = 1
+    private static let persistenceFilename = "active-stream-snapshots-v1.json"
+    private static let timeToLive: TimeInterval = 24 * 60 * 60
+    private static let maxRecordCount = 8
+    private static let maxMessageCount = 32
+    private static let maxTextLength = 16_384
+    private static let maxDisplayTitleLength = 512
+    private static let maxCompletedToolGroupCount = 12
+    private static let maxCompletedReasoningGroupCount = 12
+    private static let maxToolsPerGroup = 16
+    private static let maxLiveToolCount = 24
+    private static let maxToolPreviewLength = 4_096
+    private static let maxPinnedNoticeCount = 8
+    private static let maxPinnedNoticeLength = 4_096
+
+    private struct PersistedDocument: Codable, Sendable {
+        let version: Int
+        let records: [PersistedRecord]
+    }
+
+    private struct PersistedRecord: Codable, Sendable {
+        let key: ActiveChatStreamSnapshotKey
+        let savedAt: TimeInterval
+        let messages: [PersistedMessage]
+        let messagesOffset: Int
+        let displayTitle: String
+        let completedToolCallGroups: [PersistedToolCallGroup]
+        let completedReasoningGroups: [PersistedReasoningGroup]
+        let liveToolCalls: [PersistedToolCall]
+        let liveReasoningText: String
+        let activeStreamLastEventID: String?
+        let assistantReplayPrefixLength: Int?
+        let streamingAssistantMessageID: String?
+        let toolCallAnchorMessageID: String?
+        let reasoningAnchorMessageID: String?
+        let pinnedLocalNotices: [String]
+
+        init(
+            key: ActiveChatStreamSnapshotKey,
+            snapshot: ActiveChatStreamSnapshot,
+            savedAt: TimeInterval
+        ) {
+            self.key = key
+            self.savedAt = savedAt
+
+            let retainedMessages = Array(snapshot.messages.suffix(ActiveChatStreamSnapshotStore.maxMessageCount))
+            messages = retainedMessages.map(PersistedMessage.init)
+            messagesOffset = snapshot.messagesOffset + max(0, snapshot.messages.count - retainedMessages.count)
+            displayTitle = ActiveChatStreamSnapshotStore.bounded(
+                snapshot.displayTitle,
+                limit: ActiveChatStreamSnapshotStore.maxDisplayTitleLength
+            )
+            completedToolCallGroups = snapshot.completedToolCallGroups
+                .suffix(ActiveChatStreamSnapshotStore.maxCompletedToolGroupCount)
+                .map(PersistedToolCallGroup.init)
+            completedReasoningGroups = snapshot.completedReasoningGroups
+                .suffix(ActiveChatStreamSnapshotStore.maxCompletedReasoningGroupCount)
+                .map(PersistedReasoningGroup.init)
+            liveToolCalls = snapshot.liveToolCalls
+                .suffix(ActiveChatStreamSnapshotStore.maxLiveToolCount)
+                .map(PersistedToolCall.init)
+            liveReasoningText = ActiveChatStreamSnapshotStore.bounded(
+                snapshot.liveReasoningText,
+                limit: ActiveChatStreamSnapshotStore.maxTextLength
+            )
+            activeStreamLastEventID = ActiveChatStreamSnapshotStore.isLossyForPersistence(snapshot)
+                ? ChatStreamCoordinator.fullReplayEventID(streamID: key.streamID)
+                : snapshot.activeStreamLastEventID
+            assistantReplayPrefixLength = snapshot.assistantReplayPrefixLength
+            streamingAssistantMessageID = snapshot.streamingAssistantMessageID
+            toolCallAnchorMessageID = snapshot.toolCallAnchorMessageID
+            reasoningAnchorMessageID = snapshot.reasoningAnchorMessageID
+            pinnedLocalNotices = snapshot.pinnedLocalNotices
+                .suffix(ActiveChatStreamSnapshotStore.maxPinnedNoticeCount)
+                .map {
+                    ActiveChatStreamSnapshotStore.bounded(
+                        $0,
+                        limit: ActiveChatStreamSnapshotStore.maxPinnedNoticeLength
+                    )
+                }
+        }
+
+        var snapshot: ActiveChatStreamSnapshot {
+            ActiveChatStreamSnapshot(
+                messages: messages.map(\.message),
+                messagesOffset: messagesOffset,
+                displayTitle: displayTitle,
+                completedToolCallGroups: completedToolCallGroups.map(\.toolCallGroup),
+                completedReasoningGroups: completedReasoningGroups.map(\.reasoningGroup),
+                liveToolCalls: liveToolCalls.map(\.toolCall),
+                liveReasoningText: liveReasoningText,
+                activeStreamLastEventID: activeStreamLastEventID,
+                assistantReplayPrefixLength: assistantReplayPrefixLength,
+                streamingAssistantMessageID: streamingAssistantMessageID,
+                toolCallAnchorMessageID: toolCallAnchorMessageID,
+                reasoningAnchorMessageID: reasoningAnchorMessageID,
+                contextWindowSnapshot: nil,
+                localAttachmentPreviews: [:],
+                pinnedLocalNotices: pinnedLocalNotices
+            )
+        }
+    }
+
+    private struct PersistedMessage: Codable, Sendable {
+        let role: String?
+        let content: String?
+        let timestamp: Double?
+        let messageID: String?
+        let name: String?
+        let toolCallID: String?
+        let toolUseID: String?
+        let reasoning: String?
+        let turnTPS: Double?
+
+        init(_ message: ChatMessage) {
+            role = message.role
+            content = ActiveChatStreamSnapshotStore.bounded(
+                message.content,
+                limit: ActiveChatStreamSnapshotStore.maxTextLength
+            )
+            timestamp = message.timestamp
+            messageID = message.messageId
+            name = message.name
+            toolCallID = message.toolCallId
+            toolUseID = message.toolUseId
+            reasoning = ActiveChatStreamSnapshotStore.bounded(
+                message.reasoning,
+                limit: ActiveChatStreamSnapshotStore.maxTextLength
+            )
+            turnTPS = message.turnTps
+        }
+
+        var message: ChatMessage {
+            ChatMessage(
+                role: role,
+                content: content,
+                timestamp: timestamp,
+                messageId: messageID,
+                name: name,
+                toolCallId: toolCallID,
+                toolUseId: toolUseID,
+                reasoning: reasoning,
+                turnTps: turnTPS
+            )
+        }
+    }
+
+    private struct PersistedToolCall: Codable, Sendable {
+        let id: String
+        let name: String?
+        let preview: String?
+        let duration: Double?
+        let isError: Bool?
+        let isCompleted: Bool
+        let startedAt: Double
+
+        init(_ toolCall: ToolCall) {
+            id = toolCall.id
+            name = toolCall.name
+            preview = ActiveChatStreamSnapshotStore.bounded(
+                toolCall.preview,
+                limit: ActiveChatStreamSnapshotStore.maxToolPreviewLength
+            )
+            duration = toolCall.duration
+            isError = toolCall.isError
+            isCompleted = toolCall.isCompleted
+            startedAt = toolCall.startedAt
+        }
+
+        var toolCall: ToolCall {
+            ToolCall(
+                id: id,
+                name: name,
+                preview: preview,
+                args: nil,
+                duration: duration,
+                isError: isError,
+                isCompleted: isCompleted,
+                startedAt: startedAt
+            )
+        }
+    }
+
+    private struct PersistedToolCallGroup: Codable, Sendable {
+        let id: String
+        let anchorMessageID: String?
+        let toolCalls: [PersistedToolCall]
+
+        init(_ group: ToolCallGroup) {
+            id = group.id
+            anchorMessageID = group.anchorMessageID
+            toolCalls = group.toolCalls
+                .suffix(ActiveChatStreamSnapshotStore.maxToolsPerGroup)
+                .map(PersistedToolCall.init)
+        }
+
+        var toolCallGroup: ToolCallGroup {
+            ToolCallGroup(
+                id: id,
+                anchorMessageID: anchorMessageID,
+                toolCalls: toolCalls.map(\.toolCall)
+            )
+        }
+    }
+
+    private struct PersistedReasoningGroup: Codable, Sendable {
+        let id: String
+        let anchorMessageID: String?
+        let text: String
+
+        init(_ group: ReasoningGroup) {
+            id = group.id
+            anchorMessageID = group.anchorMessageID
+            text = ActiveChatStreamSnapshotStore.bounded(
+                group.text,
+                limit: ActiveChatStreamSnapshotStore.maxTextLength
+            )
+        }
+
+        var reasoningGroup: ReasoningGroup {
+            ReasoningGroup(id: id, anchorMessageID: anchorMessageID, text: text)
+        }
+    }
+
+    private struct InMemoryRecord {
+        let savedAt: TimeInterval
+        let snapshot: ActiveChatStreamSnapshot
+    }
+
     private let lock = NSLock()
-    private var snapshots: [ActiveChatStreamSnapshotKey: ActiveChatStreamSnapshot] = [:]
+    private let persistenceQueue = DispatchQueue(
+        label: "com.hermes.mobile.active-stream-snapshots",
+        qos: .utility
+    )
+    private var snapshots: [ActiveChatStreamSnapshotKey: InMemoryRecord] = [:]
+    /// Queue-confined durable state. No JSON or filesystem work runs while the
+    /// caller's actor (normally MainActor) is blocked.
+    private var durableRecords: [ActiveChatStreamSnapshotKey: PersistedRecord]?
+    private var persistenceDirectoryOverride: URL?
+    private var lastPersistenceOperationRanOnMainThreadForTesting: Bool?
 
     private init() {}
 
@@ -5321,27 +5776,145 @@ private final class ActiveChatStreamSnapshotStore {
         sessionID: String,
         streamID: String
     ) {
+        let snapshotKey = key(server: server, sessionID: sessionID, streamID: streamID)
+        let now = Date().timeIntervalSince1970
+        let persistedRecord = PersistedRecord(key: snapshotKey, snapshot: snapshot, savedAt: now)
+
         lock.lock()
-        defer { lock.unlock() }
-        snapshots[key(server: server, sessionID: sessionID, streamID: streamID)] = snapshot
+        snapshots[snapshotKey] = InMemoryRecord(
+            savedAt: now,
+            snapshot: persistedRecord.snapshot
+        )
+        snapshots = prunedMemoryRecords(snapshots, now: now)
+        lock.unlock()
+
+        persistenceQueue.async { [self] in
+            lastPersistenceOperationRanOnMainThreadForTesting = Thread.isMainThread
+            var records = loadDurableRecordsLocked(now: now)
+            records[snapshotKey] = persistedRecord
+            records = pruned(records, now: now)
+            durableRecords = records
+            persistLocked(records)
+        }
     }
 
+    /// Fast cache-first lookup. This method is deliberately memory-only so callers
+    /// on MainActor never perform JSON decoding or filesystem reads.
     func snapshot(server: URL, sessionID: String, streamID: String) -> ActiveChatStreamSnapshot? {
         lock.lock()
         defer { lock.unlock() }
-        return snapshots[key(server: server, sessionID: sessionID, streamID: streamID)]
+        let snapshotKey = key(server: server, sessionID: sessionID, streamID: streamID)
+        let now = Date().timeIntervalSince1970
+        snapshots = prunedMemoryRecords(snapshots, now: now)
+        return snapshots[snapshotKey]?.snapshot
+    }
+
+    /// Cold-process fallback. The serial queue preserves save/read ordering while
+    /// keeping durable decode, pruning, and any cleanup write off MainActor.
+    func snapshotFromDurableStorage(
+        server: URL,
+        sessionID: String,
+        streamID: String
+    ) async -> ActiveChatStreamSnapshot? {
+        if let snapshot = snapshot(server: server, sessionID: sessionID, streamID: streamID) {
+            return snapshot
+        }
+
+        let snapshotKey = key(server: server, sessionID: sessionID, streamID: streamID)
+        let now = Date().timeIntervalSince1970
+        let record: PersistedRecord? = await withCheckedContinuation { continuation in
+            persistenceQueue.async { [self] in
+                lastPersistenceOperationRanOnMainThreadForTesting = Thread.isMainThread
+                continuation.resume(returning: loadDurableRecordsLocked(now: now)[snapshotKey])
+            }
+        }
+        guard let record else { return nil }
+
+        return cacheRestoredSnapshot(
+            record.snapshot,
+            savedAt: record.savedAt,
+            key: snapshotKey,
+            now: now
+        )
+    }
+
+    private func cacheRestoredSnapshot(
+        _ snapshot: ActiveChatStreamSnapshot,
+        savedAt: TimeInterval,
+        key snapshotKey: ActiveChatStreamSnapshotKey,
+        now: TimeInterval
+    ) -> ActiveChatStreamSnapshot {
+        lock.lock()
+        if ChatViewModel.shouldCacheRestoredActiveStreamSnapshot(
+            existingSavedAt: snapshots[snapshotKey]?.savedAt,
+            restoredSavedAt: savedAt
+        ) {
+            snapshots[snapshotKey] = InMemoryRecord(savedAt: savedAt, snapshot: snapshot)
+        }
+        snapshots = prunedMemoryRecords(snapshots, now: now)
+        let effectiveSnapshot = snapshots[snapshotKey]?.snapshot ?? snapshot
+        lock.unlock()
+        return effectiveSnapshot
     }
 
     func remove(server: URL, sessionID: String, streamID: String) {
+        let snapshotKey = key(server: server, sessionID: sessionID, streamID: streamID)
         lock.lock()
-        defer { lock.unlock() }
-        snapshots.removeValue(forKey: key(server: server, sessionID: sessionID, streamID: streamID))
+        snapshots.removeValue(forKey: snapshotKey)
+        lock.unlock()
+
+        persistenceQueue.async { [self] in
+            lastPersistenceOperationRanOnMainThreadForTesting = Thread.isMainThread
+            var records = loadDurableRecordsLocked(now: Date().timeIntervalSince1970)
+            records.removeValue(forKey: snapshotKey)
+            durableRecords = records
+            persistLocked(records)
+        }
     }
 
+    /// Test-only reset seam. Production removal is asynchronous via `remove`.
     func removeAll() {
+        persistenceQueue.sync { [self] in
+            durableRecords = [:]
+            try? FileManager.default.removeItem(at: persistenceFileURLLocked())
+        }
         lock.lock()
-        defer { lock.unlock() }
         snapshots.removeAll()
+        lock.unlock()
+    }
+
+    /// Test-only seam that simulates a cold process while preserving the file.
+    func clearMemoryOnly() {
+        persistenceQueue.sync { [self] in
+            durableRecords = nil
+        }
+        lock.lock()
+        snapshots.removeAll()
+        lock.unlock()
+    }
+
+    /// Test-only persistence location override; drains prior work before switching.
+    func configurePersistenceDirectoryForTesting(_ directoryURL: URL?) {
+        persistenceQueue.sync { [self] in
+            persistenceDirectoryOverride = directoryURL
+            durableRecords = nil
+            lastPersistenceOperationRanOnMainThreadForTesting = nil
+        }
+        lock.lock()
+        snapshots.removeAll()
+        lock.unlock()
+    }
+
+    func waitForPendingPersistenceForTesting() async {
+        await withCheckedContinuation { continuation in
+            persistenceQueue.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    func persistenceRanOnMainThreadForTesting() -> Bool? {
+        persistenceQueue.sync { lastPersistenceOperationRanOnMainThreadForTesting }
     }
 
     private func key(server: URL, sessionID: String, streamID: String) -> ActiveChatStreamSnapshotKey {
@@ -5350,6 +5923,175 @@ private final class ActiveChatStreamSnapshotStore {
             sessionID: sessionID,
             streamID: streamID
         )
+    }
+
+    private func loadDurableRecordsLocked(now: TimeInterval) -> [ActiveChatStreamSnapshotKey: PersistedRecord] {
+        if let durableRecords {
+            let retained = pruned(durableRecords, now: now)
+            if retained.count != durableRecords.count {
+                self.durableRecords = retained
+                persistLocked(retained)
+            }
+            return retained
+        }
+
+        let fileURL = persistenceFileURLLocked()
+        guard FileManager.default.fileExists(atPath: fileURL.path),
+              let data = try? Data(contentsOf: fileURL),
+              let document = try? JSONDecoder().decode(PersistedDocument.self, from: data),
+              document.version == Self.persistenceVersion
+        else {
+            durableRecords = [:]
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+            return [:]
+        }
+
+        var decoded: [ActiveChatStreamSnapshotKey: PersistedRecord] = [:]
+        for record in document.records {
+            if let existing = decoded[record.key], existing.savedAt >= record.savedAt {
+                continue
+            }
+            decoded[record.key] = record
+        }
+
+        let retained = pruned(decoded, now: now)
+        durableRecords = retained
+        if retained.count != document.records.count {
+            persistLocked(retained)
+        }
+        return retained
+    }
+
+    private func pruned(
+        _ records: [ActiveChatStreamSnapshotKey: PersistedRecord],
+        now: TimeInterval
+    ) -> [ActiveChatStreamSnapshotKey: PersistedRecord] {
+        let oldestAllowedDate = now - Self.timeToLive
+        let newestAllowedDate = now + 5 * 60
+        let retained = records.values
+            .filter { $0.savedAt >= oldestAllowedDate && $0.savedAt <= newestAllowedDate }
+            .sorted { $0.savedAt > $1.savedAt }
+            .prefix(Self.maxRecordCount)
+
+        return Dictionary(uniqueKeysWithValues: retained.map { ($0.key, $0) })
+    }
+
+    private func prunedMemoryRecords(
+        _ records: [ActiveChatStreamSnapshotKey: InMemoryRecord],
+        now: TimeInterval
+    ) -> [ActiveChatStreamSnapshotKey: InMemoryRecord] {
+        let oldestAllowedDate = now - Self.timeToLive
+        let newestAllowedDate = now + 5 * 60
+        let retained = records
+            .filter { $0.value.savedAt >= oldestAllowedDate && $0.value.savedAt <= newestAllowedDate }
+            .sorted { $0.value.savedAt > $1.value.savedAt }
+            .prefix(Self.maxRecordCount)
+
+        return Dictionary(uniqueKeysWithValues: retained.map { ($0.key, $0.value) })
+    }
+
+    private func persistLocked(_ records: [ActiveChatStreamSnapshotKey: PersistedRecord]) {
+        let fileURL = persistenceFileURLLocked()
+        guard !records.isEmpty else {
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
+
+        do {
+            let directoryURL = fileURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: directoryURL,
+                withIntermediateDirectories: true,
+                attributes: nil
+            )
+            let document = PersistedDocument(
+                version: Self.persistenceVersion,
+                records: records.values.sorted { $0.savedAt > $1.savedAt }
+            )
+            let data = try JSONEncoder().encode(document)
+            try data.write(to: fileURL, options: .atomic)
+            #if os(iOS)
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: fileURL.path
+            )
+            #endif
+        } catch {
+            // The live in-memory snapshot remains authoritative when persistence is unavailable.
+        }
+    }
+
+    private func persistenceFileURLLocked() -> URL {
+        if let persistenceDirectoryOverride {
+            return persistenceDirectoryOverride
+                .appendingPathComponent(Self.persistenceFilename, isDirectory: false)
+        }
+
+        let applicationSupportURL = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first
+            ?? FileManager.default.temporaryDirectory
+        return applicationSupportURL
+            .appendingPathComponent("HermesMobile", isDirectory: true)
+            .appendingPathComponent("ActiveStreamSnapshots", isDirectory: true)
+            .appendingPathComponent(Self.persistenceFilename, isDirectory: false)
+    }
+
+    private static func bounded(_ value: String?, limit: Int) -> String? {
+        guard let value else { return nil }
+        guard value.count > limit else { return value }
+        return String(value.prefix(limit))
+    }
+
+    private static func bounded(_ value: String, limit: Int) -> String {
+        guard value.count > limit else { return value }
+        return String(value.prefix(limit))
+    }
+
+    private static func isLossyForPersistence(_ snapshot: ActiveChatStreamSnapshot) -> Bool {
+        if snapshot.messages.count > maxMessageCount ||
+            snapshot.displayTitle.count > maxDisplayTitleLength ||
+            snapshot.completedToolCallGroups.count > maxCompletedToolGroupCount ||
+            snapshot.completedReasoningGroups.count > maxCompletedReasoningGroupCount ||
+            snapshot.liveToolCalls.count > maxLiveToolCount ||
+            snapshot.liveReasoningText.count > maxTextLength {
+            return true
+        }
+
+        if snapshot.messages.contains(where: { message in
+            (message.content?.count ?? 0) > maxTextLength ||
+                (message.reasoning?.count ?? 0) > maxTextLength ||
+                message.toolCalls?.isEmpty == false ||
+                message.contentParts?.isEmpty == false ||
+                message.attachments?.isEmpty == false
+        }) {
+            return true
+        }
+
+        if snapshot.completedReasoningGroups.contains(where: { $0.text.count > maxTextLength }) {
+            return true
+        }
+
+        let completedTools = snapshot.completedToolCallGroups.flatMap(\.toolCalls)
+        if snapshot.completedToolCallGroups.contains(where: { $0.toolCalls.count > maxToolsPerGroup }) ||
+            completedTools.contains(where: toolCallIsLossyForPersistence) ||
+            snapshot.liveToolCalls.contains(where: toolCallIsLossyForPersistence) {
+            return true
+        }
+
+        return false
+    }
+
+    private static func toolCallIsLossyForPersistence(_ toolCall: ToolCall) -> Bool {
+        // Raw tool arguments are intentionally not persisted because they can contain
+        // sensitive or very large payloads. They still drive expanded detail rows and
+        // per-turn file attribution, so advancing beyond an event that carried them
+        // would permanently omit visible state. Keep them off disk, but rebuild
+        // canonically from event zero. A truncated preview is likewise lossy.
+        toolCall.args?.isEmpty == false ||
+            (toolCall.preview?.count ?? 0) > maxToolPreviewLength
     }
 }
 

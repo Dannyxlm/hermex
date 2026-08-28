@@ -2209,6 +2209,726 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(viewModel.activeStreamID, "stream-123")
     }
 
+    func testExternalStreamActivationRestoresLiveSnapshotBeforeNetworkLoad() {
+        runMainActorTest {
+            ChatViewModel.resetActiveStreamSnapshotsForTesting()
+            defer { ChatViewModel.resetActiveStreamSnapshotsForTesting() }
+            let originalStreamClient = SpySSEStreamingClient()
+            let originalViewModel = try self.makeViewModel(streamClient: originalStreamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStart = await originalViewModel.sendMessage("Keep working")
+            XCTAssertTrue(didStart)
+            originalStreamClient.emit(.token("Fresh live answer."), lastEventID: "session-abc:9")
+            originalViewModel.suspendStreamForNavigation()
+
+            let reopenedViewModel = try self.makeViewModel(
+                streamClient: SpySSEStreamingClient()
+            ) { request in
+                XCTFail("External activation must render its snapshot before any network request: \(request)")
+                throw URLError(.badServerResponse)
+            }
+
+            reopenedViewModel.prepareForExternalStreamActivation(streamID: "stream-123")
+
+            XCTAssertEqual(reopenedViewModel.activeStreamID, "stream-123")
+            XCTAssertTrue(reopenedViewModel.isActiveStreamConnectionSuspended)
+            XCTAssertEqual(
+                reopenedViewModel.messages.compactMap(\.content),
+                ["Keep working", "Fresh live answer."]
+            )
+        }
+    }
+
+    func testDurableSnapshotHydrationRejectsAStreamThatWasReplacedWhileReading() {
+        XCTAssertTrue(ChatViewModel.shouldApplyDurableActiveStreamSnapshot(
+            requestedStreamID: "stream-a",
+            currentActiveStreamID: "stream-a"
+        ))
+        XCTAssertFalse(ChatViewModel.shouldApplyDurableActiveStreamSnapshot(
+            requestedStreamID: "stream-a",
+            currentActiveStreamID: "stream-b"
+        ))
+        XCTAssertFalse(ChatViewModel.shouldApplyDurableActiveStreamSnapshot(
+            requestedStreamID: "stream-a",
+            currentActiveStreamID: nil
+        ))
+    }
+
+    func testOlderDurableSnapshotCannotReplaceNewerInMemoryRecord() {
+        XCTAssertTrue(ChatViewModel.shouldCacheRestoredActiveStreamSnapshot(
+            existingSavedAt: nil,
+            restoredSavedAt: 100
+        ))
+        XCTAssertTrue(ChatViewModel.shouldCacheRestoredActiveStreamSnapshot(
+            existingSavedAt: 99,
+            restoredSavedAt: 100
+        ))
+        XCTAssertFalse(ChatViewModel.shouldCacheRestoredActiveStreamSnapshot(
+            existingSavedAt: 101,
+            restoredSavedAt: 100
+        ))
+        XCTAssertFalse(ChatViewModel.shouldCacheRestoredActiveStreamSnapshot(
+            existingSavedAt: 100,
+            restoredSavedAt: 100
+        ))
+    }
+
+    func testExternalStreamActivationRestoresDurableSnapshotAfterMemoryReset() {
+        runMainActorTest {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("active-stream-snapshot-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: directory)
+            defer {
+                ChatViewModel.resetActiveStreamSnapshotsForTesting()
+                ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: nil)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            let originalStreamClient = SpySSEStreamingClient()
+            let originalViewModel = try self.makeViewModel(streamClient: originalStreamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStart = await originalViewModel.sendMessage("Keep working")
+            XCTAssertTrue(didStart)
+            originalStreamClient.emit(.reasoning("Checking the newest state."))
+            originalStreamClient.emit(.token("Durable live answer."), lastEventID: "session-abc:11")
+            originalViewModel.suspendStreamForNavigation()
+            await ChatViewModel.awaitActiveStreamSnapshotPersistenceForTesting()
+            XCTAssertEqual(
+                ChatViewModel.activeStreamSnapshotPersistenceRanOnMainThreadForTesting(),
+                false,
+                "Durable JSON and filesystem work must run off MainActor"
+            )
+
+            let files = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )
+            XCTAssertFalse(files.isEmpty)
+
+            ChatViewModel.clearActiveStreamSnapshotMemoryForTesting()
+
+            let reopenedStreamClient = SpySSEStreamingClient()
+            let durableViewModel = try self.makeViewModel(
+                streamClient: reopenedStreamClient
+            ) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+                return apiTestJSONResponse(
+                    #"{"active":false,"stream_id":"stream-123","replay_available":true}"#,
+                    for: request
+                )
+            }
+            durableViewModel.prepareForExternalStreamActivation(streamID: "stream-123")
+            await durableViewModel.reconnectStreamIfNeeded()
+
+            XCTAssertEqual(durableViewModel.activeStreamID, "stream-123")
+            XCTAssertFalse(durableViewModel.isActiveStreamConnectionSuspended)
+            XCTAssertEqual(durableViewModel.liveReasoningText, "Checking the newest state.")
+            XCTAssertEqual(
+                durableViewModel.messages.compactMap(\.content),
+                ["Keep working", "Durable live answer."]
+            )
+        }
+    }
+
+    func testExternalStreamActivationKeepsLiveProjectionWhenSessionReloadFallsBackOffline() {
+        runMainActorTest {
+            ChatViewModel.resetActiveStreamSnapshotsForTesting()
+            defer { ChatViewModel.resetActiveStreamSnapshotsForTesting() }
+
+            let context = try self.makeContext()
+            try CacheStore.cacheMessages(
+                [
+                    ChatMessage(role: "user", content: "Older cached question", timestamp: 1_770_000_001, messageId: "cached-user"),
+                    ChatMessage(role: "assistant", content: "Older cached answer", timestamp: 1_770_000_002, messageId: "cached-assistant")
+                ],
+                serverURL: URL(string: "https://example.test")!,
+                sessionID: "session-abc",
+                in: context
+            )
+
+            let originalStreamClient = SpySSEStreamingClient()
+            let originalViewModel = try self.makeViewModel(streamClient: originalStreamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse(
+                    #"{"session_id":"session-abc","stream_id":"stream-live-activity"}"#,
+                    for: request
+                )
+            }
+
+            let didStart = await originalViewModel.sendMessage("Newest in-flight question")
+            XCTAssertTrue(didStart)
+            originalStreamClient.emit(.reasoning("Inspecting the newest state."))
+            originalStreamClient.emit(.toolStarted(ToolStreamEvent(
+                eventType: "tool.started",
+                name: "read_file",
+                preview: "Reading newest state",
+                args: ["path": .string("STATE.md")],
+                duration: nil,
+                isError: nil
+            )))
+            originalStreamClient.emit(
+                .token("Newest partial answer."),
+                lastEventID: "session-abc:15"
+            )
+            originalViewModel.suspendStreamForNavigation()
+
+            let reopenedViewModel = try self.makeViewModel(streamClient: SpySSEStreamingClient()) { request in
+                XCTAssertEqual(request.url?.path, "/api/session")
+                throw URLError(.timedOut)
+            }
+            reopenedViewModel.prepareForExternalStreamActivation(streamID: "stream-live-activity")
+
+            await reopenedViewModel.loadMessages(modelContext: context)
+
+            XCTAssertEqual(reopenedViewModel.activeStreamID, "stream-live-activity")
+            XCTAssertTrue(reopenedViewModel.isActiveStreamConnectionSuspended)
+            XCTAssertEqual(
+                reopenedViewModel.messages.compactMap(\.content),
+                ["Newest in-flight question", "Newest partial answer."]
+            )
+            XCTAssertEqual(reopenedViewModel.liveReasoningText, "Inspecting the newest state.")
+            XCTAssertEqual(reopenedViewModel.liveToolCalls.map(\.name), ["read_file"])
+            XCTAssertTrue(reopenedViewModel.isViewingCachedData)
+        }
+    }
+
+    func testActiveStreamSnapshotCacheEvictsOldestRecordFromMemoryAndDisk() {
+        runMainActorTest {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("active-stream-snapshot-cap-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: directory)
+            defer {
+                ChatViewModel.resetActiveStreamSnapshotsForTesting()
+                ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: nil)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            for index in 0..<9 {
+                let streamID = "stream-\(index)"
+                let streamClient = SpySSEStreamingClient()
+                let viewModel = try self.makeViewModel(streamClient: streamClient) { request in
+                    XCTAssertEqual(request.url?.path, "/api/chat/start")
+                    return apiTestJSONResponse("""
+                    {
+                      "session_id": "session-abc",
+                      "stream_id": "\(streamID)"
+                    }
+                    """, for: request)
+                }
+
+                let didStart = await viewModel.sendMessage("Prompt \(index)")
+                XCTAssertTrue(didStart)
+                streamClient.emit(
+                    .token("Answer \(index)"),
+                    lastEventID: "session-abc:\(index + 1)"
+                )
+                viewModel.suspendStreamForNavigation()
+            }
+
+            let evictedViewModel = try self.makeViewModel(
+                streamClient: SpySSEStreamingClient()
+            ) { request in
+                XCTFail("Cache-only activation must not make a network request: \(request)")
+                throw URLError(.badServerResponse)
+            }
+            evictedViewModel.prepareForExternalStreamActivation(streamID: "stream-0")
+            XCTAssertTrue(
+                evictedViewModel.messages.isEmpty,
+                "The oldest snapshot must be evicted from memory when the durable eight-record cap is reached"
+            )
+
+            let newestViewModel = try self.makeViewModel(
+                streamClient: SpySSEStreamingClient()
+            ) { request in
+                XCTFail("Cache-only activation must not make a network request: \(request)")
+                throw URLError(.badServerResponse)
+            }
+            newestViewModel.prepareForExternalStreamActivation(streamID: "stream-8")
+            XCTAssertEqual(
+                newestViewModel.messages.compactMap(\.content),
+                ["Prompt 8", "Answer 8"]
+            )
+        }
+    }
+
+    func testReopenedActiveStreamReplayUsesRestoredSnapshotEventID() {
+        runMainActorTest {
+            ChatViewModel.resetActiveStreamSnapshotsForTesting()
+            defer { ChatViewModel.resetActiveStreamSnapshotsForTesting() }
+            let originalStreamClient = SpySSEStreamingClient()
+            let originalViewModel = try self.makeViewModel(streamClient: originalStreamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStart = await originalViewModel.sendMessage("Keep working")
+            XCTAssertTrue(didStart)
+            originalStreamClient.emit(.token("Partial live answer."), lastEventID: "session-abc:9")
+            originalViewModel.suspendStreamForNavigation()
+
+            let reopenedStreamClient = SpySSEStreamingClient()
+            let reopenedViewModel = try self.makeViewModel(streamClient: reopenedStreamClient) { request in
+                switch request.url?.path {
+                case "/api/session":
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "active_stream_id": "stream-123",
+                        "messages": [
+                          {
+                            "role": "user",
+                            "content": "Keep working",
+                            "timestamp": 1770000100,
+                            "message_id": "user-1"
+                          }
+                        ]
+                      }
+                    }
+                    """, for: request)
+                case "/api/chat/stream/status":
+                    return apiTestJSONResponse("""
+                    {
+                      "active": true,
+                      "stream_id": "stream-123",
+                      "replay_available": true
+                    }
+                    """, for: request)
+                default:
+                    XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                    throw URLError(.badURL)
+                }
+            }
+
+            await reopenedViewModel.loadMessages()
+            await reopenedViewModel.reconnectStreamIfNeeded()
+
+            let replayURL = try XCTUnwrap(reopenedStreamClient.startedURLs.last)
+            let replayQueryItems = URLComponents(url: replayURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "stream_id" })?.value, "stream-123")
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "replay" })?.value, "1")
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "after_seq" })?.value, "9")
+            XCTAssertEqual(reopenedViewModel.messages.compactMap(\.content), ["Keep working", "Partial live answer."])
+        }
+    }
+
+    @MainActor
+    func testReopeningActiveStreamSeedsReplayDedupAtSnapshotBoundaryWhenServerIsAhead() async throws {
+        let originalStreamClient = SpySSEStreamingClient()
+        let originalViewModel = try makeViewModel(streamClient: originalStreamClient) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/start")
+            return apiTestJSONResponse(
+                #"{"session_id":"session-abc","stream_id":"stream-123"}"#,
+                for: request
+            )
+        }
+
+        let didStart = await originalViewModel.sendMessage("Keep working")
+        XCTAssertTrue(didStart)
+        originalStreamClient.emit(.token("AB"), lastEventID: "session-abc:2")
+        originalViewModel.suspendStreamForNavigation()
+
+        let reopenedStreamClient = SpySSEStreamingClient()
+        let reopenedViewModel = try makeViewModel(streamClient: reopenedStreamClient) { request in
+            switch request.url?.path {
+            case "/api/session":
+                let components = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)
+                let query = Dictionary(
+                    uniqueKeysWithValues: (components?.queryItems ?? []).map { ($0.name, $0.value ?? "") }
+                )
+                if query["msg_before"] == "2" {
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "active_stream_id": "stream-123",
+                        "messages": [
+                          {
+                            "role": "user",
+                            "content": "Old question",
+                            "timestamp": 1769999998,
+                            "message_id": "old-user"
+                          },
+                          {
+                            "role": "assistant",
+                            "content": "Old answer",
+                            "timestamp": 1769999999,
+                            "message_id": "old-assistant"
+                          }
+                        ],
+                        "_messages_truncated": false,
+                        "_messages_offset": 0
+                      }
+                    }
+                    """, for: request)
+                }
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "title": "Planning",
+                    "active_stream_id": "stream-123",
+                    "messages": [
+                      {
+                        "role": "user",
+                        "content": "Keep working",
+                        "timestamp": 1770000100,
+                        "message_id": "user-1"
+                      },
+                      {
+                        "role": "assistant",
+                        "content": "ABCDEF",
+                        "timestamp": 1770000101,
+                        "message_id": "assistant-1"
+                      }
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 2
+                  }
+                }
+                """, for: request)
+            case "/api/chat/stream/status":
+                return apiTestJSONResponse(
+                    #"{"active":true,"stream_id":"stream-123","replay_available":true}"#,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await reopenedViewModel.loadMessages()
+        await reopenedViewModel.reconnectStreamIfNeeded()
+
+        let replayURL = try XCTUnwrap(reopenedStreamClient.startedURLs.last)
+        let replayQueryItems = URLComponents(url: replayURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(replayQueryItems.first(where: { $0.name == "after_seq" })?.value, "2")
+        XCTAssertEqual(reopenedViewModel.messages.last?.content, "ABCDEF")
+
+        let didLoadOlder = await reopenedViewModel.loadOlderMessages()
+        XCTAssertTrue(didLoadOlder)
+        reopenedStreamClient.emit(.token("CD"), lastEventID: "session-abc:3")
+        reopenedStreamClient.emit(.token("EF"), lastEventID: "session-abc:4")
+        reopenedViewModel.flushPendingStreamingContent()
+
+        XCTAssertEqual(
+            reopenedViewModel.messages.last?.content,
+            "ABCDEF",
+            "Replay after the saved cursor must survive pagination without duplicating a server-ahead suffix"
+        )
+    }
+
+    func testLossyDurableSnapshotRewindsReplayCursorToAvoidSkippingOmittedOutput() {
+        runMainActorTest {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("active-stream-lossy-snapshot-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: directory)
+            defer {
+                ChatViewModel.resetActiveStreamSnapshotsForTesting()
+                ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: nil)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            let oversizedPartial = String(repeating: "x", count: 17_000)
+            let originalStreamClient = SpySSEStreamingClient()
+            let originalViewModel = try self.makeViewModel(streamClient: originalStreamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStart = await originalViewModel.sendMessage("Keep working")
+            XCTAssertTrue(didStart)
+            originalStreamClient.emit(.token(oversizedPartial), lastEventID: "session-abc:25")
+            originalViewModel.suspendStreamForNavigation()
+
+            let memoryReopenedViewModel = try self.makeViewModel { request in
+                XCTFail("Memory snapshot paint must not require network: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+            memoryReopenedViewModel.prepareForExternalStreamActivation(streamID: "stream-123")
+            XCTAssertEqual(
+                memoryReopenedViewModel.messages.last?.content?.count,
+                16_384,
+                "The in-memory cache must use the same bounded projection as durable storage"
+            )
+
+            ChatViewModel.clearActiveStreamSnapshotMemoryForTesting()
+
+            let reopenedStreamClient = SpySSEStreamingClient()
+            let reopenedViewModel = try self.makeViewModel(streamClient: reopenedStreamClient) { request in
+                switch request.url?.path {
+                case "/api/session":
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "active_stream_id": "stream-123",
+                        "messages": []
+                      }
+                    }
+                    """, for: request)
+                case "/api/chat/stream/status":
+                    return apiTestJSONResponse("""
+                    {
+                      "active": true,
+                      "stream_id": "stream-123",
+                      "replay_available": true
+                    }
+                    """, for: request)
+                default:
+                    XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                    throw URLError(.badURL)
+                }
+            }
+
+            reopenedViewModel.prepareForExternalStreamActivation(streamID: "stream-123")
+
+            await reopenedViewModel.loadMessages()
+            await reopenedViewModel.reconnectStreamIfNeeded()
+
+            XCTAssertEqual(reopenedViewModel.messages.compactMap(\.content).first, "Keep working")
+            XCTAssertEqual(reopenedViewModel.messages.count, 2)
+            XCTAssertEqual(
+                reopenedViewModel.messages.last?.content?.count,
+                16_384,
+                "The bounded cached prefix must stay visible until full replay output begins"
+            )
+            let replayURL = try XCTUnwrap(reopenedStreamClient.startedURLs.last)
+            let replayQueryItems = URLComponents(url: replayURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "stream_id" })?.value, "stream-123")
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "replay" })?.value, "1")
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "after_seq" })?.value, "0")
+
+            reopenedStreamClient.emit(.token(oversizedPartial), lastEventID: "session-abc:25")
+            XCTAssertEqual(
+                reopenedViewModel.messages.last?.content?.count,
+                17_000,
+                "Full replay must replace—not append onto—the lossy cached prefix"
+            )
+        }
+    }
+
+    func testStructuredMessageDurableSnapshotRewindsReplayCursorToAvoidSkippingOmittedFields() {
+        runMainActorTest {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("active-stream-structured-snapshot-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: directory)
+            defer {
+                ChatViewModel.resetActiveStreamSnapshotsForTesting()
+                ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: nil)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            let structuredSessionResponse = """
+            {
+              "session": {
+                "session_id": "session-abc",
+                "title": "Planning",
+                "active_stream_id": "stream-123",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Run terminal",
+                    "timestamp": 1770000100,
+                    "message_id": "user-1"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "",
+                    "timestamp": 1770000110,
+                    "message_id": "assistant-tool",
+                    "tool_calls": [
+                      {
+                        "id": "functions.terminal:1",
+                        "function": {
+                          "name": "terminal",
+                          "arguments": "{\\"command\\":\\"pwd\\"}"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """
+            let originalStreamClient = SpySSEStreamingClient()
+            let originalViewModel = try self.makeViewModel(streamClient: originalStreamClient) { request in
+                switch request.url?.path {
+                case "/api/chat/start":
+                    return apiTestJSONResponse(
+                        #"{"session_id":"session-abc","stream_id":"stream-123"}"#,
+                        for: request
+                    )
+                case "/api/session":
+                    return apiTestJSONResponse(structuredSessionResponse, for: request)
+                default:
+                    XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                    throw URLError(.badURL)
+                }
+            }
+
+            let didStart = await originalViewModel.sendMessage("Run terminal")
+            XCTAssertTrue(didStart)
+            await originalViewModel.loadMessages()
+            XCTAssertEqual(originalViewModel.messages.last?.toolCalls?.count, 1)
+            originalStreamClient.emit(.token("Continuing."), lastEventID: "session-abc:25")
+            originalViewModel.suspendStreamForNavigation()
+            ChatViewModel.clearActiveStreamSnapshotMemoryForTesting()
+
+            let reopenedStreamClient = SpySSEStreamingClient()
+            let reopenedViewModel = try self.makeViewModel(streamClient: reopenedStreamClient) { request in
+                switch request.url?.path {
+                case "/api/session":
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "active_stream_id": "stream-123",
+                        "messages": []
+                      }
+                    }
+                    """, for: request)
+                case "/api/chat/stream/status":
+                    return apiTestJSONResponse(
+                        #"{"active": true, "stream_id": "stream-123", "replay_available": true}"#,
+                        for: request
+                    )
+                default:
+                    XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                    throw URLError(.badURL)
+                }
+            }
+
+            await reopenedViewModel.loadMessages()
+            await reopenedViewModel.reconnectStreamIfNeeded()
+
+            let replayURL = try XCTUnwrap(reopenedStreamClient.startedURLs.last)
+            let replayQueryItems = URLComponents(url: replayURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "replay" })?.value, "1")
+            XCTAssertEqual(
+                replayQueryItems.first(where: { $0.name == "after_seq" })?.value,
+                "0",
+                "Omitted structured fields require canonical replay rather than advancing past them"
+            )
+            XCTAssertEqual(
+                reopenedViewModel.messages.compactMap(\.content),
+                ["Run terminal", "Continuing."],
+                "The lossy cached turn must remain visible until canonical replay output begins"
+            )
+        }
+    }
+
+    func testToolArgumentsOmittedFromDurableSnapshotForceFullReplay() {
+        runMainActorTest {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("active-stream-tool-args-snapshot-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: directory)
+            defer {
+                ChatViewModel.resetActiveStreamSnapshotsForTesting()
+                ChatViewModel.configureActiveStreamSnapshotsForTesting(directoryURL: nil)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            let originalStreamClient = SpySSEStreamingClient()
+            let originalViewModel = try self.makeViewModel(streamClient: originalStreamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse(
+                    #"{"session_id":"session-abc","stream_id":"stream-123"}"#,
+                    for: request
+                )
+            }
+
+            let didStart = await originalViewModel.sendMessage("Update README")
+            XCTAssertTrue(didStart)
+            originalStreamClient.emit(
+                .toolStarted(ToolStreamEvent(
+                    eventType: "tool.started",
+                    name: "patch",
+                    preview: "Updating README.md",
+                    args: ["path": .string("README.md")],
+                    duration: nil,
+                    isError: nil
+                )),
+                lastEventID: "session-abc:25"
+            )
+            originalViewModel.suspendStreamForNavigation()
+            ChatViewModel.clearActiveStreamSnapshotMemoryForTesting()
+
+            let reopenedStreamClient = SpySSEStreamingClient()
+            let reopenedViewModel = try self.makeViewModel(streamClient: reopenedStreamClient) { request in
+                switch request.url?.path {
+                case "/api/session":
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "active_stream_id": "stream-123",
+                        "messages": []
+                      }
+                    }
+                    """, for: request)
+                case "/api/chat/stream/status":
+                    return apiTestJSONResponse(
+                        #"{"active": true, "stream_id":"stream-123", "replay_available": true}"#,
+                        for: request
+                    )
+                default:
+                    XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                    throw URLError(.badURL)
+                }
+            }
+
+            await reopenedViewModel.loadMessages()
+            await reopenedViewModel.reconnectStreamIfNeeded()
+
+            let replayURL = try XCTUnwrap(reopenedStreamClient.startedURLs.last)
+            let replayQueryItems = URLComponents(url: replayURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            XCTAssertEqual(replayQueryItems.first(where: { $0.name == "replay" })?.value, "1")
+            XCTAssertEqual(
+                replayQueryItems.first(where: { $0.name == "after_seq" })?.value,
+                "0",
+                "Omitted tool arguments must be recovered by canonical replay"
+            )
+        }
+    }
+
     func testReopenedInactiveStreamReplayUsesRestoredSnapshotEventID() {
         runMainActorTest {
             ChatViewModel.resetActiveStreamSnapshotsForTesting()
@@ -5014,14 +5734,47 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertTrue(didRequestStatus)
         XCTAssertEqual(sessionReloadCount, 2)
         XCTAssertEqual(reopenedStreamClient.startedURLs.count, 1)
+        let resumedURL = try XCTUnwrap(reopenedStreamClient.startedURLs.first)
+        let resumedQueryItems = URLComponents(url: resumedURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(resumedQueryItems.first(where: { $0.name == "replay" })?.value, "1")
+        XCTAssertEqual(resumedQueryItems.first(where: { $0.name == "after_seq" })?.value, "0")
         XCTAssertEqual(reopenedViewModel.activeStreamID, "stream-123")
-        XCTAssertEqual(reopenedViewModel.liveReasoningText, "Planning the tiger story.")
+        XCTAssertEqual(
+            reopenedViewModel.liveReasoningText,
+            "Planning the tiger story.",
+            "A lossy snapshot must remain visible until canonical replay output begins"
+        )
         XCTAssertEqual(reopenedViewModel.liveToolCalls.count, 1)
         XCTAssertEqual(reopenedViewModel.liveToolCalls.first?.name, "read_file")
         XCTAssertEqual(reopenedViewModel.liveToolCalls.first?.isCompleted, true)
+        XCTAssertNil(
+            reopenedViewModel.liveToolCalls.first?.args,
+            "Raw tool arguments must remain outside the durable continuity projection"
+        )
         XCTAssertEqual(reopenedViewModel.messages.compactMap(\.role), ["user", "assistant"])
         XCTAssertEqual(reopenedViewModel.messages.last?.content, "Once Raj reached the river. ")
 
+        // The first canonical replay event replaces the lossy projection, then the
+        // replayed current turn is rebuilt from journal sequence zero without gaps
+        // or duplicated cached output.
+        reopenedStreamClient.emit(.reasoning("Planning the tiger story."))
+        reopenedStreamClient.emit(.toolStarted(ToolStreamEvent(
+            eventType: "tool.started",
+            name: "read_file",
+            preview: "Reading jungle notes",
+            args: ["path": .string("notes.md")],
+            duration: nil,
+            isError: nil
+        )))
+        reopenedStreamClient.emit(.toolCompleted(ToolStreamEvent(
+            eventType: "tool.completed",
+            name: "read_file",
+            preview: "Read jungle notes",
+            args: ["path": .string("notes.md")],
+            duration: 0.15,
+            isError: false
+        )))
+        reopenedStreamClient.emit(.token("Once Raj reached the river. "))
         reopenedStreamClient.emit(.token("The snare broke."))
 
         XCTAssertEqual(

@@ -19,6 +19,49 @@ final class ChatScrollPolicyTests: XCTestCase {
         XCTAssertTrue(ChatInitialAppearancePolicy.shouldBeginAsyncWork(hasCompletedAppearance: true))
     }
 
+    func testInitialTaskCannotRestartAfterStartupCompletes() {
+        XCTAssertTrue(
+            ChatInitialAppearancePolicy.shouldRunInitialTask(
+                hasCompletedInitialStartup: false
+            )
+        )
+        XCTAssertFalse(
+            ChatInitialAppearancePolicy.shouldRunInitialTask(
+                hasCompletedInitialStartup: true
+            )
+        )
+    }
+
+    func testFirstOnAppearDefersReconnectToInitialStartupOwner() {
+        XCTAssertFalse(
+            ChatInitialAppearancePolicy.shouldReconnectOnAppear(
+                hasCompletedInitialStartup: false
+            )
+        )
+        XCTAssertTrue(
+            ChatInitialAppearancePolicy.shouldReconnectOnAppear(
+                hasCompletedInitialStartup: true
+            )
+        )
+    }
+
+    @MainActor
+    func testInitialAppearancePreparesCacheBeforeAwaitedDraftHydration() async {
+        var events: [String] = []
+
+        await ChatInitialAppearancePolicy.prepareCacheBeforeDraftHydration(
+            prepareCache: {
+                events.append("cache")
+            },
+            hydrateDraft: {
+                await Task.yield()
+                events.append("draft")
+            }
+        )
+
+        XCTAssertEqual(events, ["cache", "draft"])
+    }
+
     func testBottomThresholdLoosensWhileStreaming() {
         XCTAssertEqual(
             ChatScrollPolicy.bottomThreshold(isStreaming: false),
